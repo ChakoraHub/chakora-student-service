@@ -3313,6 +3313,405 @@ async def feedback_form(request: Request, request_id: Optional[str] = None, meet
 # ═════════════════════════════════════════════════════════
 
 
+# =========================================================
+# PROVIDER-BASED ACTIVITIES AGGLOMERATOR & STARTUP LOGIC
+# =========================================================
+
+def init_feedback_columns():
+    conn = get_db_connection()
+    if not conn:
+        print("[WARNING] Failed to connect to DB for column checks")
+        return
+    try:
+        cursor = conn.cursor()
+        # Add REQUEST_ID, ACTIVITY_TYPE, ACTIVITY_ID columns to NRM_FEEDBACK_REQUESTS
+        for col_name, col_type in [("REQUEST_ID", "VARCHAR2(255)"), ("ACTIVITY_TYPE", "VARCHAR2(50)"), ("ACTIVITY_ID", "VARCHAR2(255)")]:
+            try:
+                cursor.execute(f"ALTER TABLE NRM_FEEDBACK_REQUESTS ADD {col_name} {col_type}")
+                conn.commit()
+                print(f"[OK] Added {col_name} column to NRM_FEEDBACK_REQUESTS")
+            except Exception as e:
+                if "01430" not in str(e):
+                    print(f"[WARNING] NRM_FEEDBACK_REQUESTS schema info for {col_name}: {e}")
+                    
+        # Add REQUEST_ID column to NRM_FEEDBACK
+        try:
+            cursor.execute("ALTER TABLE NRM_FEEDBACK ADD REQUEST_ID VARCHAR2(255)")
+            conn.commit()
+            print("[OK] Added REQUEST_ID column to NRM_FEEDBACK")
+        except Exception as e:
+            if "01430" not in str(e):
+                print(f"[WARNING] NRM_FEEDBACK schema info for REQUEST_ID: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.on_event("startup")
+async def on_startup():
+    init_feedback_columns()
+
+@app.get("/api/student/report/students")
+async def get_report_students():
+    """
+    Returns list of all students for Student Report page.
+    """
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = None
+    try:
+        cursor = conn.cursor(DictCursor)
+        cursor.execute(
+            """
+            SELECT DISTINCT
+                NVL(s.FIRST_NAME, u.USERNAME) as "first_name",
+                NVL(s.LAST_NAME, '') as "last_name",
+                r.REGISTRATION_ID as "registration_id",
+                u.EMAIL as "email",
+                u.PHONE as "phone",
+                NVL(s.LOCATION, 'Online') as "address"
+            FROM NRM_REGISTRATIONS r
+            JOIN NRM_STUDENTS s ON r.STUDENT_ID = s.ID
+            JOIN NRM_USERS u ON s.USER_ID = u.ID
+            ORDER BY r.REGISTRATION_ID DESC
+            """
+        )
+        students = cursor.fetchall() or []
+        return {"success": True, "data": students}
+    except Exception as e:
+        print(f"[ERROR] get_report_students failed: {e}")
+        return {"success": False, "data": [], "message": str(e)}
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+@app.post("/api/student/report/certificate")
+async def get_report_certificate(req: Dict[str, Any] = Body(...)):
+    reg_id = req.get("reg_id")
+    if not reg_id:
+        raise HTTPException(status_code=400, detail="Registration ID required")
+    
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = None
+    try:
+        cursor = conn.cursor(DictCursor)
+        cursor.execute(
+            """
+            SELECT 
+                NVL(s.FIRST_NAME, u.USERNAME) as "first_name",
+                NVL(s.LAST_NAME, '') as "last_name",
+                c.COURSE_NAME as "course_name",
+                NVL(st.STATUS, 'Completed') as "status",
+                TO_CHAR(r.START_DATE, 'YYYY-MM-DD') as "registration_date"
+            FROM NRM_REGISTRATIONS r
+            JOIN NRM_STUDENTS s ON r.STUDENT_ID = s.ID
+            JOIN NRM_USERS u ON s.USER_ID = u.ID
+            JOIN NRM_COURSES c ON r.COURSE_ID = c.ID
+            LEFT JOIN NRM_STATUSES st ON r.STATUS_ID = st.ID
+            WHERE UPPER(TRIM(r.REGISTRATION_ID)) = UPPER(TRIM(%s))
+            """,
+            (reg_id,)
+        )
+        student = cursor.fetchone()
+        if not student:
+            return JSONResponse(status_code=404, content={"success": False, "message": "Student not found"})
+        return {"success": True, "student": student}
+    except Exception as e:
+        print(f"[ERROR] get_report_certificate failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+@app.get("/api/student/report/student-view")
+async def get_student_view(reg_id: str = Query(...)):
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = None
+    try:
+        cursor = conn.cursor(DictCursor)
+        cursor.execute(
+            """
+            SELECT 
+                NVL(s.FIRST_NAME, u.USERNAME) as "first_name",
+                NVL(s.LAST_NAME, '') as "last_name",
+                u.EMAIL as "email",
+                u.PHONE as "phone",
+                r.REGISTRATION_ID as "registration_id",
+                c.COURSE_NAME as "course_name",
+                NVL(st.STATUS, 'Active') as "status",
+                TO_CHAR(r.START_DATE, 'YYYY-MM-DD') as "start_date"
+            FROM NRM_REGISTRATIONS r
+            JOIN NRM_STUDENTS s ON r.STUDENT_ID = s.ID
+            JOIN NRM_USERS u ON s.USER_ID = u.ID
+            JOIN NRM_COURSES c ON r.COURSE_ID = c.ID
+            LEFT JOIN NRM_STATUSES st ON r.STATUS_ID = st.ID
+            WHERE UPPER(TRIM(r.REGISTRATION_ID)) = UPPER(TRIM(%s))
+            """,
+            (reg_id,)
+        )
+        student = cursor.fetchone()
+        if not student:
+            return JSONResponse(status_code=404, content={"success": False, "message": "Student not found"})
+        return {"success": True, "student": student}
+    except Exception as e:
+        print(f"[ERROR] get_student_view failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+@app.get("/api/student/report/all-activities")
+async def get_all_student_activities():
+    """
+    Fast batch query returning map of registration_id -> activities array.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return {"success": False, "data": {}}
+    cursor = None
+    try:
+        cursor = conn.cursor(DictCursor)
+        cursor.execute(
+            """
+            SELECT r.REGISTRATION_ID, u.EMAIL, c.COURSE_NAME, r.COURSE_ID
+            FROM NRM_REGISTRATIONS r
+            JOIN NRM_STUDENTS s ON r.STUDENT_ID = s.ID
+            JOIN NRM_USERS u ON s.USER_ID = u.ID
+            JOIN NRM_COURSES c ON r.COURSE_ID = c.ID
+            """
+        )
+        rows = cursor.fetchall() or []
+        result = {}
+        for r in rows:
+            reg_id = r["REGISTRATION_ID"]
+            if reg_id not in result:
+                result[reg_id] = []
+            result[reg_id].append({
+                "id": f"COURSE-{r['COURSE_ID']}",
+                "type": "Course",
+                "label": f"Course: {r['COURSE_NAME']}",
+                "eligible": True
+            })
+
+        # Also merge logged activities from FEEDBACK_ACTIVITY
+        try:
+            cursor.execute(
+                """
+                SELECT fa.EMAIL, fa.MODULE_NAME, fa.ACTIVITY_TYPE, fa.ACTIVITY_NAME, fa.ACTIVITY_ID, r.REGISTRATION_ID
+                FROM FEEDBACK_ACTIVITY fa
+                JOIN NRM_USERS u ON LOWER(TRIM(fa.EMAIL)) = LOWER(TRIM(u.EMAIL))
+                JOIN NRM_STUDENTS s ON u.ID = s.USER_ID
+                JOIN NRM_REGISTRATIONS r ON s.ID = r.STUDENT_ID
+                """
+            )
+            fa_rows = cursor.fetchall() or []
+            for fa in fa_rows:
+                reg_id = fa["REGISTRATION_ID"]
+                if reg_id not in result:
+                    result[reg_id] = []
+                result[reg_id].append({
+                    "id": fa["ACTIVITY_ID"],
+                    "type": fa["MODULE_NAME"] or fa["ACTIVITY_TYPE"] or "Activity",
+                    "label": f"{fa['MODULE_NAME']}: {fa['ACTIVITY_NAME']}",
+                    "eligible": True
+                })
+        except Exception:
+            pass
+
+        return {"success": True, "data": result}
+    except Exception as e:
+        print(f"[ERROR] get_all_student_activities failed: {e}")
+        return {"success": False, "data": {}}
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+@app.get("/api/student/activities")
+async def get_student_activities(reg_id: str = Query(...)):
+    """
+    Generic Provider-Based Activities Aggregator.
+    Gathers active courses, scheduled meetings, and internships for a student.
+    Caches aggregated list in Redis DB 8 for 5 minutes.
+    """
+    cache_key = f"chakorahub:student:activities:{reg_id}"
+    
+    # ── STEP 1: Redis cache check ───────────────────────
+    try:
+        cache_resp = _redis("GET", "/redis/get", params={"key": cache_key, "db": 8})
+        if cache_resp and cache_resp.get("success") and cache_resp.get("found"):
+            val = cache_resp.get("value")
+            if val:
+                cached_data = json.loads(val)
+                print(f"[cache] aggregated activities HIT for key: {cache_key}")
+                return cached_data
+    except Exception as e:
+        print(f"[WARNING] Activities cache read error: {e}")
+
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+        
+    cursor = None
+    try:
+        cursor = conn.cursor(DictCursor)
+        
+        # Look up student's details using REGISTRATION_ID
+        cursor.execute(
+            """
+            SELECT r.STUDENT_ID, u.EMAIL, NVL(s.FIRST_NAME, u.USERNAME) as FIRST_NAME, NVL(s.LAST_NAME, '') as LAST_NAME
+            FROM NRM_REGISTRATIONS r
+            JOIN NRM_STUDENTS s ON r.STUDENT_ID = s.ID
+            JOIN NRM_USERS u ON s.USER_ID = u.ID
+            WHERE r.REGISTRATION_ID = %s
+            """,
+            (reg_id,)
+        )
+        student_info = cursor.fetchone()
+        if not student_info:
+            raise HTTPException(status_code=404, detail="Student registration not found")
+            
+        student_id = student_info["STUDENT_ID"]
+        email = student_info["EMAIL"]
+        student_name = f"{student_info['FIRST_NAME']} {student_info['LAST_NAME'] or ''}".strip()
+        
+        activities = []
+        
+        # 1. Course Provider (Queries Oracle DB)
+        try:
+            cursor.execute(
+                """
+                SELECT c.COURSE_NAME, r.COURSE_ID, r.STATUS_ID
+                FROM NRM_REGISTRATIONS r
+                JOIN NRM_COURSES c ON r.COURSE_ID = c.ID
+                WHERE r.STUDENT_ID = %s
+                """,
+                (student_id,)
+            )
+            for row in cursor.fetchall():
+                activities.append({
+                    "id": f"COURSE-{row['COURSE_ID']}",
+                    "type": "Course",
+                    "label": f"Course: {row['COURSE_NAME']}",
+                    "eligible": True
+                })
+        except Exception as ce:
+            print(f"[WARNING] Course Provider lookup failed: {ce}")
+
+        # 2. Centralized FEEDBACK_ACTIVITY Provider (Queries Oracle DB)
+        try:
+            cursor.execute(
+                """
+                SELECT ACTIVITY_ID, MODULE_NAME, ACTIVITY_TYPE, ACTIVITY_NAME
+                FROM FEEDBACK_ACTIVITY
+                WHERE LOWER(TRIM(EMAIL)) = LOWER(TRIM(%s))
+                """,
+                (email,)
+            )
+            for row in cursor.fetchall():
+                activities.append({
+                    "id": row["ACTIVITY_ID"],
+                    "type": row["MODULE_NAME"] or row["ACTIVITY_TYPE"] or "Activity",
+                    "label": f"{row['MODULE_NAME']}: {row['ACTIVITY_NAME']}",
+                    "eligible": True
+                })
+        except Exception as fae:
+            print(f"[WARNING] FEEDBACK_ACTIVITY Provider lookup failed: {fae}")
+            
+        # 3. Meeting Provider (Queries DynamoDB via existing lookup function)
+        try:
+            bookings = query_dynamo_bookings(email)
+            for b in bookings:
+                booking_id = b.get("booking_id") or b.get("id") or "UNKNOWN"
+                purpose = b.get("purpose") or "Mentorship Session"
+                date_str = b.get("created_at") or ""
+                activities.append({
+                    "id": f"MEET-{booking_id}",
+                    "type": "Meeting",
+                    "label": f"Meeting: {purpose} ({date_str[:10]})",
+                    "eligible": True
+                })
+        except Exception as me:
+            print(f"[WARNING] Meeting Provider lookup failed: {me}")
+            
+        # 4. Internship Provider (Queries Snowflake NRM_INTERNSHIP_APPLICATIONS)
+        try:
+            import snowflake.connector
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            key_path = os.path.join(script_dir, "rsa_key.p8")
+            if os.path.exists(key_path):
+                with open(key_path, "rb") as key_file:
+                    private_key = serialization.load_pem_private_key(
+                        key_file.read(),
+                        password=None,
+                        backend=default_backend()
+                     )
+                pkb = private_key.private_bytes(
+                    encoding=serialization.Encoding.DER,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                )
+                snowflake_conn = snowflake.connector.connect(
+                    user='ChakoraHub',
+                    account='gpguymt-ta88699',
+                    private_key=pkb,
+                    warehouse='COMPUTE_WH',
+                    database='"VSRSUBHASH$CHAKORA_DB"',
+                    schema="CHAKORA",
+                    login_timeout=3
+                )
+                snowflake_cursor = snowflake_conn.cursor()
+                snowflake_cursor.execute(
+                    """
+                    SELECT INTERN_ID, INTERNSHIP_DOMAIN, STATUS
+                    FROM NRM_INTERNSHIP_APPLICATIONS
+                    WHERE LOWER(TRIM(EMAIL)) = LOWER(TRIM(%s))
+                    """,
+                    (email,)
+                )
+                for row in snowflake_cursor.fetchall():
+                    activities.append({
+                        "id": f"INT-{row[0]}",
+                        "type": "Internship",
+                        "label": f"Internship: {row[1]} ({row[2]})",
+                        "eligible": True
+                    })
+                snowflake_cursor.close()
+                snowflake_conn.close()
+        except Exception as se:
+            print(f"[WARNING] Internship Provider lookup failed: {se}")
+            
+        result = {
+            "success": True,
+            "student_name": student_name,
+            "student_email": email,
+            "activities": activities
+        }
+        
+        # ── Cache result in Redis ───────────────────────────
+        try:
+            _redis(
+                "POST",
+                "/redis/set",
+                json={"key": cache_key, "value": json.dumps(result), "db": 8, "ttl": 300}
+            )
+            print(f"[cache] aggregated activities stored for key: {cache_key}")
+        except Exception as re:
+            print(f"[WARNING] Failed to write activities to Redis cache: {re}")
+
+        return result
+    except Exception as e:
+        print(f"[ERROR] get_student_activities failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
 def generate_ml_suggestion(bookings):
     """
     Generate ML-based suggestions from booking history

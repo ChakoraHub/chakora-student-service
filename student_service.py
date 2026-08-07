@@ -5,29 +5,9 @@ Run  : uvicorn student_service:app --host 0.0.0.0 --port 8001
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Architecture : [User] → [Flask Proxy app.py] → [This Service] → [Oracle]
-                                                      ↕
-                                               [redis_service :6380]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Redis Cache Strategy (all via redis_service HTTP API)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Key                            DB  TTL      Set on           Cleared on
-  ─────────────────────────────  ──  ───────  ───────────────  ─────────────────
-  session:{user_id}               0  7 days   login            logout
-  user:{user_id}                  1  30 min   login, profile   profile update
-  roles:{user_id}                 2  1 hr     login            logout
-  student:dashboard:{user_id}     5  5 min    dashboard GET    profile/role chg
-  resources:{subject}:{lang}      3  2 hr     first fetch      —  (auto-expire)
-  resources:{subject}:files       3  2 hr     first fetch      —  (auto-expire)
-  offers:{date}                   3  1 hr     first fetch      —  (auto-expire)
-  festival:{date}                 3  24 hr    first fetch      —  (auto-expire)
-  feedbacks:latest                3  10 min   first fetch      new submission
-  registration:{user_id}          3  5 min    first fetch      —  (auto-expire)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import uvicorn
 import traceback
-import redis
 import oracledb
 import os, json, uuid, httpx
 import boto3
@@ -64,7 +44,6 @@ INTERNSHIP_SERVICE_URL = os.getenv("INTERNSHIP_SERVICE_URL","http://localhost:50
 MS365_SERVICE_URL = os.getenv("MS365_SERVICE_URL","http://localhost:7700")
 EMPLOYEE_SERVICE_URL = os.getenv("EMPLOYEE_SERVICE_URL","http://localhost:8002")
 BLOGGER_SERVICE_URL = os.getenv("BLOGGER_SERVICE_URL","http://localhost:7500")
-REDIS_SERVICE_URL = os.getenv("REDIS_SERVICE_URL","http://localhost:6390")
 BRS_SERVICE_URL = os.getenv("BRS_SERVICE_URL","http://localhost:8020")
 LAMBDA_URL = 'https://lwug4xhfz27whiuu3acjfwsgtm0ttwja.lambda-url.eu-north-1.on.aws/'
 STATIC_CDN = "https://d1pjjckqswt5z7.cloudfront.net"
@@ -93,13 +72,9 @@ app.add_middleware(
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-REDIS_SVC = os.getenv("REDIS_SERVICE_URL", "http://localhost:6390")
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REGISTRATION_STREAM_NAME = os.getenv("REGISTRATION_STREAM_NAME", "registration_stream")
 
-# TTL constants (must match redis_service.py)
+# TTL constants
 TTL_SESSION      = 604_800   # 7 days
 TTL_PROFILE      = 1_800     # 30 min
 TTL_AUTH         = 3_600     # 1 hr
@@ -199,43 +174,21 @@ ALLOWED_EXTENSIONS = {
 }
 
 # ─────────────────────────────────────────────
-# REDIS HTTP HELPER  — fire-and-forget safe
-# Any Redis failure is non-fatal; service falls back to Oracle.
+# CACHE BACKEND (local no-op compatible stub)
 # ─────────────────────────────────────────────
-def _redis_service_candidates() -> List[str]:
-    base = (REDIS_SVC or "http://localhost:6380").rstrip("/")
-    candidates = [base]
-    if base.endswith(":6380"):
-        candidates.append(base[:-5] + ":6390")
-    elif base.endswith(":6390"):
-        candidates.append(base[:-5] + ":6380")
-    else:
-        candidates.extend(["http://localhost:6380", "http://127.0.0.1:6380"])
-
-    # Deduplicate while preserving order.
-    seen = set()
-    unique = []
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            unique.append(c)
-    return unique
+_LOCAL_CACHE: Dict[str, Any] = {}
 
 
-def _redis(method: str, path: str, **kwargs) -> Optional[Dict]:
-    for base_url in _redis_service_candidates():
-        try:
-            with httpx.Client(timeout=2.0) as client:
-                fn = {"GET": client.get, "POST": client.post, "DELETE": client.delete}.get(method)
-                if fn is None:
-                    return None
-                resp = fn(f"{base_url}{path}", **kwargs)
-                resp.raise_for_status()
-                return resp.json()
-        except Exception as exc:
-            print(f"⚠️  redis_service {method} {path} @ {base_url} → {exc}")
-            continue
-    return None
+def _cache_set(key: str, value: Any) -> None:
+    _LOCAL_CACHE[key] = value
+
+
+def _cache_get(key: str) -> Optional[Any]:
+    return _LOCAL_CACHE.get(key)
+
+
+def _cache_delete(key: str) -> None:
+    _LOCAL_CACHE.pop(key, None)
 
 
 def _json_default(value):
@@ -292,28 +245,7 @@ def _run_lookup_consumer():
         try:
             normalized = identity.lower().strip()
 
-            # ── STEP 1: Redis cache check ───────────────────────
-            cache_key = f"meeting:user:{normalized}"
-            cache_resp = _redis("GET", "/redis/get", params={"key": cache_key, "db": 8})
-            if cache_resp and cache_resp.get("success") and cache_resp.get("found"):
-                try:
-                    bookings = json.loads(cache_resp.get("value") or "[]")
-                except Exception:
-                    bookings = []
-                latest = bookings[0] if bookings else {}
-                result_payload.update({
-                    "exists":        True,
-                    "source":        "redis",
-                    "student_email": latest.get("student_email"),
-                    "student_phone": latest.get("student_phone"),
-                    "student_name":  latest.get("student_name"),
-                    "total_bookings": len(bookings),
-                    "ml_suggestion": generate_ml_suggestion(bookings)
-                })
-                kafka_publish("student.lookup.completed", result_payload)
-                continue   # ← next Kafka message
-
-            # ── STEP 2: DynamoDB lookup ─────────────────────────
+            # Cache is disabled; perform direct lookup.
             dynamodb = boto3.resource(
                 "dynamodb",
                 region_name=os.getenv("AWS_REGION", "eu-north-1"),
@@ -335,11 +267,6 @@ def _run_lookup_consumer():
 
             if bookings:
                 latest = bookings[0] if bookings else {}
-                _redis(
-                    "POST",
-                    "/redis/set",
-                    json={"key": f"meeting:user:{normalized}", "value": json.dumps(bookings, default=_json_default), "db": 8, "ttl": 120},
-                )
                 result_payload.update({
                     "exists":        True,
                     "source":        "dynamodb",
@@ -359,87 +286,77 @@ def _run_lookup_consumer():
         kafka_publish("student.lookup.completed", result_payload)
 
 # ─────────────────────────────────────────────
-# CACHE HELPERS — each one is a thin wrapper
-# matching the canonical key names exactly.
+# CACHE HELPERS
 # ─────────────────────────────────────────────
 
 # ── 1. Session  (key: session:{user_id}) ──────────────────
 def cache_session_set(user_id: int, data: dict) -> None:
-    _redis("POST", "/session/set", json={"user_id": user_id, "data": data, "ttl": TTL_SESSION})
+    _cache_set(f"session:{user_id}", data)
 
 def cache_session_get(user_id: int) -> Optional[dict]:
-    r = _redis("GET", "/session/get", params={"user_id": user_id})
-    return r["data"] if r and r.get("found") else None
+    value = _cache_get(f"session:{user_id}")
+    return value if isinstance(value, dict) else None
 
 def cache_session_delete(user_id: int) -> None:
-    _redis("DELETE", "/session/delete", params={"user_id": user_id})
+    _cache_delete(f"session:{user_id}")
 
 def cache_session_refresh(user_id: int) -> None:
-    """Slide TTL on every authenticated request (keep-alive)."""
-    _redis("POST", "/session/refresh", params={"user_id": user_id, "ttl": TTL_SESSION})
+    """No-op for local cache backend."""
+    _ = user_id
 
 
 # ── 2. User Profile  (key: user:{user_id}) ────────────────
 def cache_profile_set(user_id: int, data: dict) -> None:
-    _redis("POST", "/profile/set", json={"user_id": user_id, "data": data, "ttl": TTL_PROFILE})
+    _cache_set(f"user:{user_id}", data)
 
 def cache_profile_get(user_id: int) -> Optional[dict]:
-    r = _redis("GET", "/profile/get", params={"user_id": user_id})
-    return r["data"] if r and r.get("found") else None
+    value = _cache_get(f"user:{user_id}")
+    return value if isinstance(value, dict) else None
 
 def cache_profile_delete(user_id: int) -> None:
-    _redis("DELETE", "/profile/delete", params={"user_id": user_id})
+    _cache_delete(f"user:{user_id}")
 
 
 # ── 3. Auth / Roles  (key: roles:{user_id}) ──────────────
 def cache_auth_set(user_id: int, roles: list, usertype: str) -> None:
-    _redis("POST", "/auth/set", json={"user_id": user_id, "roles": roles,
-                                      "usertype": usertype, "ttl": TTL_AUTH})
+    _cache_set(f"roles:{user_id}", {"roles": roles, "usertype": usertype})
 
 def cache_auth_get(user_id: int) -> Optional[dict]:
-    r = _redis("GET", "/auth/get", params={"user_id": user_id})
-    return r["data"] if r and r.get("found") else None
+    value = _cache_get(f"roles:{user_id}")
+    return value if isinstance(value, dict) else None
 
 def cache_auth_delete(user_id: int) -> None:
-    _redis("DELETE", "/auth/delete", params={"user_id": user_id})
+    _cache_delete(f"roles:{user_id}")
 
 
 # ── 4. Frequent Data  (caller-defined keys, DB 3) ────────
 def cache_freq_set(key: str, data: Any, ttl: int) -> None:
-    _redis("POST", "/freq/set", json={"key": key, "data": data, "ttl": ttl})
+    _ = ttl
+    _cache_set(key, data)
 
 def cache_freq_get(key: str) -> Optional[Any]:
-    r = _redis("GET", "/freq/get", params={"key": key})
-    return r["data"] if r and r.get("found") else None
+    return _cache_get(key)
 
 def cache_freq_delete(key: str) -> None:
-    _redis("DELETE", "/freq/delete", params={"key": key})
+    _cache_delete(key)
 
 
 # ── 5. Rate Limit check ──────────────────────────────────
 def rate_limit_ok(identifier: str, endpoint: str) -> bool:
-    """Returns True = allowed, False = blocked. Fails open."""
-    cfg = RATE_LIMITS.get(endpoint, {"limit": 30, "window": 60})
-    r = _redis("POST", "/ratelimit/check", params={
-        "identifier": identifier, "endpoint": endpoint,
-        "limit": cfg["limit"], "window": cfg["window"],
-    })
-    return r.get("allowed", True) if r else True
+    """Returns True = allowed (rate limiting disabled)."""
+    _ = (identifier, endpoint)
+    return True
 
 
 # ── 6. Dashboard/API Response Cache  (key: student:dashboard:{user_id}) ─
 def cache_dashboard_set(user_id: int, data: Any) -> None:
-    _redis("POST", "/apicache/set", json={
-        "cache_key": f"student:dashboard:{user_id}",
-        "response": data, "ttl": TTL_DASHBOARD,
-    })
+    _cache_set(f"student:dashboard:{user_id}", data)
 
 def cache_dashboard_get(user_id: int) -> Optional[Any]:
-    r = _redis("GET", "/apicache/get", params={"cache_key": f"student:dashboard:{user_id}"})
-    return r["data"] if r and r.get("found") else None
+    return _cache_get(f"student:dashboard:{user_id}")
 
 def cache_dashboard_delete(user_id: int) -> None:
-    _redis("DELETE", "/apicache/delete", params={"cache_key": f"student:dashboard:{user_id}"})
+    _cache_delete(f"student:dashboard:{user_id}")
 
 
 # ─────────────────────────────────────────────
@@ -901,13 +818,12 @@ async def health_check():
     db_ok = conn is not None
     if conn:
         conn.close()
-    redis_ok = _redis("GET", "/health") is not None
     return {
         "status":    "healthy",
         "service":   "student-service",
         "version":   "3.0",
         "database":  "connected" if db_ok else "disconnected",
-        "redis":     "connected" if redis_ok else "unavailable",
+        "cache":     "disabled",
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -1368,7 +1284,7 @@ async def get_shop_courses():
     """
     Returns the active course catalogue with live pricing from Oracle PRICING_LOOKUP.
     Called by app.py /api/shop/courses to replace the hardcoded PRODUCTS array.
-    Cached in Redis for 30 minutes under key shop:courses.
+    Cached for 30 minutes under key shop:courses.
     """
     CACHE_KEY = "shop:courses"
     cached = cache_freq_get(CACHE_KEY)
@@ -1623,14 +1539,13 @@ async def student_login(payload: LoginRequest):
         }
         cache_profile_set(user_id, profile_data)     # user:{user_id}     30 min
         # Resources page profile cache
-        _redis(
-            "POST",
-            "/resources/session/set",
-            json={
+        _cache_set(
+            f"resources:session:{user_id}",
+            {
                 "user_id": str(user_id),
                 "username": email or phone,
                 "usertype": usertype,
-                "profile_pic": pic
+                "profile_pic": pic,
             },
         )
         cache_auth_set(user_id, roles, usertype)     # roles:{user_id}    1 hr
@@ -1936,32 +1851,7 @@ async def student_registration(payload: StudentRegistrationRequest):
         )
         conn.commit()
 
-        try:
-            redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                db=REDIS_DB,
-                decode_responses=False,
-            ).xadd(
-                REGISTRATION_STREAM_NAME,
-                {
-                    "registration_id": reg_id,
-                    "user_id": str(user_id),
-                    "student_id": str(student_id),
-                    "payment_id": payment_id,
-                    "order_id": order_id,
-                    "course_id": str(course_id),
-                    "course_name": course_name,
-                    "payment_amount": str(course_fee),
-                    "student_name": f"{first_name} {last_name}",
-                    "student_email": email,
-                    "language_id": str(language_id),
-                    "start_date": start_date_raw,
-                },
-            )
-            print(f"✅ Registration event pushed to Redis stream: {reg_id}")
-        except Exception as e:
-            print(f"⚠️ Warning: Could not push to Redis stream: {e}")
+        print(f"ℹ️ Registration stream publish skipped (stream backend decoupled): {reg_id}")
 
         return {
             "success": True,
@@ -3031,7 +2921,7 @@ async def student_lookup(
     """
     Student identity lookup
     Flow:
-    Redis Cache -> DynamoDB
+    Direct DynamoDB lookup
     """
     try:
         normalized_query = query.strip().lower()
@@ -3046,35 +2936,7 @@ async def student_lookup(
                 }
             )
 
-        # STEP 1 — REDIS CACHE LOOKUP
-        cache_key = f"meeting:user:{normalized_query}"
-        cache_resp = _redis("GET", "/redis/get", params={"key": cache_key, "db": 8})
-        if cache_resp and cache_resp.get("success") and cache_resp.get("found"):
-            try:
-                bookings = json.loads(cache_resp.get("value") or "[]")
-            except Exception:
-                bookings = []
-            print(f"🎯 Cache HIT for: {normalized_query}")
-            latest_booking = bookings[0] if bookings else {}
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "exists": True,
-                    "cache_hit": True,
-                    "source": "redis",
-                    "query_type": query_type,
-                    "student_email": latest_booking.get("student_email"),
-                    "student_phone": latest_booking.get("student_phone"),
-                    "student_name": latest_booking.get("student_name"),
-                    "total_bookings": len(bookings),
-                    "bookings": bookings,
-                    "ml_suggestion": generate_ml_suggestion(bookings)
-                }
-            )
-
-        # STEP 2 — CACHE MISS → DYNAMODB
-        print(f"❌ Cache MISS for: {normalized_query}")
+        # Cache is disabled; always query DB.
         bookings = query_dynamo_bookings(normalized_query)
 
         # STEP 3 — NEW USER
@@ -3093,15 +2955,7 @@ async def student_lookup(
                 }
             )
 
-        # STEP 4 — CACHE WARMING
-        _redis(
-            "POST",
-            "/redis/set",
-            json={"key": f"meeting:user:{normalized_query}", "value": json.dumps(bookings), "db": 8, "ttl": 120},
-        )
-        print(f"📝 Cache warmed for: {normalized_query}")
-
-        # STEP 5 — EXISTING USER RESPONSE
+        # Existing user response
         latest_booking = bookings[0] if bookings else {}
 
         return JSONResponse(
@@ -3209,7 +3063,6 @@ async def generate_feedback_link(payload: FeedbackGenerateRequest):
             if reg_row:
                 reg_id = reg_row["REGISTRATION_ID"]
                 cache_key = f"chakorahub:student:activities:{reg_id}"
-                _redis("DELETE", "/redis/delete", params={"key": cache_key, "db": 8})
                 print(f"[cache] Evicted activities cache for key: {cache_key} (feedback generated)")
         except Exception as e:
             print(f"[WARNING] Failed to evict activities cache: {e}")

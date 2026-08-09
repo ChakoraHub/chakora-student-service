@@ -152,6 +152,17 @@ COURSE_NAME_MAP = {
     "snowflake":                  "Snowflake",
 }
 
+COURSE_CARD_IMAGE_COLUMN_CANDIDATES = [
+    "IMAGE_S3_URL",
+    "COURSE_IMAGE_URL",
+    "IMAGE_URL",
+    "THUMBNAIL_URL",
+    "COURSE_THUMBNAIL_URL",
+    "S3_URL",
+    "COURSE_URL",
+    "URL",
+]
+
 SERVICE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_ROOT = os.path.join(SERVICE_DIR, "uploads")
 PRACTICE_TESTS_FOLDER = os.path.join(UPLOAD_ROOT, "practice_tests")
@@ -195,6 +206,40 @@ def _json_default(value):
     if isinstance(value, Decimal):
         return int(value) if value % 1 == 0 else float(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _resolve_course_card_image_column(cursor) -> Optional[str]:
+    """Resolve the optional course image URL column added to NRM_COURSES."""
+    try:
+        cursor.execute(
+            """
+            SELECT COLUMN_NAME
+            FROM USER_TAB_COLUMNS
+            WHERE TABLE_NAME = 'NRM_COURSES'
+            """
+        )
+        user_cols = {(row.get("COLUMN_NAME") or "").upper() for row in (cursor.fetchall() or [])}
+    except Exception:
+        user_cols = set()
+
+    if not user_cols:
+        try:
+            cursor.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM ALL_TAB_COLUMNS
+                WHERE OWNER = 'CHAKORA' AND TABLE_NAME = 'NRM_COURSES'
+                """
+            )
+            user_cols = {(row.get("COLUMN_NAME") or "").upper() for row in (cursor.fetchall() or [])}
+        except Exception:
+            user_cols = set()
+
+    for col in COURSE_CARD_IMAGE_COLUMN_CANDIDATES:
+        if col in user_cols:
+            return col
+    return None
+
 
 # Kafka Consumer helper function
 
@@ -508,7 +553,7 @@ class StudentRegistrationRequest(BaseModel):
     course: int
     offering_id: int
     language: int
-    start_date: str
+    start_date: Optional[str] = None
     payment_id: Optional[str] = None
     order_id: Optional[str] = None
     signature: Optional[str] = None
@@ -921,6 +966,74 @@ async def admin_courses():
         return cursor.fetchall() or []
     except Exception as e:
         print(f"❌ admin_courses error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/api/student/resources-courses")
+async def resources_courses():
+    """Return active course cards for Website resources grid.
+
+    Uses the optional 4th URL/image column from NRM_COURSES when available.
+    """
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    cursor = conn.cursor(DictCursor)
+    try:
+        image_col = _resolve_course_card_image_column(cursor)
+        print(f"[resources_courses] resolved image column: {image_col or 'NONE'}")
+
+        if image_col:
+            query = f"""
+                SELECT
+                    c.ID,
+                    c.COURSE_NAME,
+                    c.COURSE_CODE,
+                    c.{image_col} AS IMAGE_URL
+                FROM NRM_COURSES c
+                ORDER BY c.COURSE_NAME
+            """
+        else:
+            query = """
+                SELECT
+                    c.ID,
+                    c.COURSE_NAME,
+                    c.COURSE_CODE,
+                    '' AS IMAGE_URL
+                FROM NRM_COURSES c
+                ORDER BY c.COURSE_NAME
+            """
+
+        cursor.execute(query)
+        rows = cursor.fetchall() or []
+
+        courses = []
+        for idx, row in enumerate(rows, start=1):
+            course_name = str(row.get("COURSE_NAME") or "").strip()
+            if not course_name:
+                continue
+
+            courses.append(
+                {
+                    "id": row.get("ID"),
+                    "course_code": row.get("COURSE_CODE") or "",
+                    "subject": course_name,
+                    "sub_id": f"sub{idx}",
+                    "image_url": (row.get("IMAGE_URL") or "").strip(),
+                }
+            )
+
+        return {
+            "success": True,
+            "courses": courses,
+            "image_column": image_col or "",
+        }
+    except Exception as e:
+        print(f"❌ resources_courses error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         cursor.close()
@@ -1711,13 +1824,15 @@ async def student_registration(payload: StudentRegistrationRequest):
         raise HTTPException(status_code=400, detail="Invalid course or language selection.")
 
     if not start_date_raw:
-        raise HTTPException(status_code=400, detail="Start date is required.")
-    try:
-        start_date = datetime.strptime(start_date_raw, "%Y-%m-%d")
-        if start_date.date() < datetime.now().date():
-            raise HTTPException(status_code=400, detail="Start date cannot be in the past.")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+        # Backward compatibility: older website payloads do not send start_date.
+        start_date = datetime.now()
+    else:
+        try:
+            start_date = datetime.strptime(start_date_raw, "%Y-%m-%d")
+            if start_date.date() < datetime.now().date():
+                raise HTTPException(status_code=400, detail="Start date cannot be in the past.")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
     conn = get_db_connection()
     if not conn:
@@ -1827,9 +1942,9 @@ async def student_registration(payload: StudentRegistrationRequest):
         cursor.execute(
             """
             INSERT INTO NRM_REGISTRATIONS
-            (REGISTRATION_ID, STUDENT_ID, COURSE_ID, LANGUAGE_ID, START_DATE, STATUS_ID, CREATED_DT, OFFERING_ID,
+            (REGISTRATION_ID, STUDENT_ID, COURSE_ID, LANGUAGE_ID, STATUS_ID, CREATED_DT, OFFERING_ID,
              QUALIFICATION, COLLEGE, BRANCH, PASSING_YEAR, EXPERIENCE, RESUME_FILE_NAME, RESUME_S3_KEY, RESUME_UPLOADED_AT)
-            VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s,
+            VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s,
                     %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
             """,
             (
@@ -1837,7 +1952,6 @@ async def student_registration(payload: StudentRegistrationRequest):
                 student_id,
                 course_id,
                 language_id,
-                start_date,
                 active_id,
                 offering_id,
                 qualification,
@@ -1851,7 +1965,24 @@ async def student_registration(payload: StudentRegistrationRequest):
         )
         conn.commit()
 
-        print(f"ℹ️ Registration stream publish skipped (stream backend decoupled): {reg_id}")
+        kafka_publish("registration.completed", {
+            "event_id": str(uuid.uuid4()),
+            "event_type": "registration.completed",
+            "timestamp": datetime.utcnow().isoformat(),
+            "registration_id": reg_id,
+            "user_id": user_id,
+            "student_name": f"{first_name} {last_name}".strip(),
+            "student_email": email,
+            "course_name": course_name,
+            "course_id": course_id,
+            "offering_id": offering_id,
+            "language_id": language_id,
+            "payment_id": payment_id,
+            "order_id": order_id,
+            "payment_amount": course_fee,
+            "registration_type": registration_type,
+        })
+        print(f"✅ Published registration.completed | reg_id={reg_id} user_id={user_id}")
 
         return {
             "success": True,
@@ -3364,10 +3495,9 @@ def _handle_order_confirmed(payload: dict) -> None:
             cursor.execute("""
                 INSERT INTO NRM_REGISTRATIONS
                 (REGISTRATION_ID, STUDENT_ID, COURSE_ID, LANGUAGE_ID,
-                 START_DATE, STATUS_ID, CREATED_DT)
-                VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-            """, (reg_id, student_id, course_id, language_id,
-                  start_date.strftime("%Y-%m-%d"), active_id))
+                 STATUS_ID, CREATED_DT)
+                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            """, (reg_id, student_id, course_id, language_id, active_id))
 
             print(f"✅ Auto-registered: reg_id={reg_id} order_id={order_id} course_id={course_id}")
 

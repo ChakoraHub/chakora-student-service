@@ -2856,6 +2856,136 @@ async def get_roles(user_id: int):
         conn.close()
 
 
+@app.get("/api/student/calendar-events")
+async def student_calendar_events(
+    start: str,
+    end: str,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+):
+    """Return normalized calendar events for mobile calendar screen.
+
+    Combines:
+    - Festivals from NRM_FESTIVALS
+    - User meetings from meeting_service (if email/phone provided)
+    """
+    try:
+        start_date = datetime.strptime(start, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end, "%Y-%m-%d").date()
+        if end_date < start_date:
+            raise HTTPException(status_code=400, detail="end must be on/after start")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    events = []
+
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    cursor = conn.cursor(DictCursor)
+    try:
+        cursor.execute(
+            """
+            SELECT FESTIVAL_NAME, FESTIVAL_DATE
+            FROM NRM_FESTIVALS
+            WHERE FESTIVAL_DATE BETWEEN %s AND %s
+            ORDER BY FESTIVAL_DATE ASC
+            """,
+            (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
+        )
+        festival_rows = cursor.fetchall() or []
+
+        for row in festival_rows:
+            festival_name = str(row.get("FESTIVAL_NAME") or "Festival").strip()
+            festival_date = row.get("FESTIVAL_DATE")
+            if hasattr(festival_date, "strftime"):
+                start_iso = festival_date.strftime("%Y-%m-%d")
+            else:
+                start_iso = str(festival_date)
+
+            events.append(
+                {
+                    "title": festival_name,
+                    "start": f"{start_iso}T00:00:00",
+                    "end": None,
+                    "type": "festival",
+                    "festival_name": festival_name,
+                    "slot": "",
+                    "status": "",
+                    "details": "",
+                    "organizer": "",
+                    "student_email": "",
+                    "join_url": "",
+                }
+            )
+    finally:
+        cursor.close()
+        conn.close()
+
+    user_email = (email or "").strip().lower()
+    user_phone = (phone or "").strip()
+    if user_email or user_phone:
+        try:
+            params = {"email": user_email} if user_email else {"phone": user_phone}
+            resp = requests.get(f"{MEETING_SERVICE_URL}/meeting/user-bookings", params=params, timeout=10)
+            payload = resp.json() if resp.status_code == 200 else {}
+            bookings = payload.get("bookings") if isinstance(payload, dict) else []
+            if isinstance(bookings, list):
+                for b in bookings:
+                    if not isinstance(b, dict):
+                        continue
+
+                    booking_date = str(b.get("booking_date") or "").strip()
+                    if not booking_date:
+                        continue
+                    try:
+                        booking_dt = datetime.strptime(booking_date, "%Y-%m-%d").date()
+                    except ValueError:
+                        continue
+                    if booking_dt < start_date or booking_dt > end_date:
+                        continue
+
+                    start_time = str(b.get("start_time") or "09:00").strip()
+                    duration = int(b.get("duration_minutes") or 0)
+
+                    try:
+                        start_clock = datetime.strptime(start_time, "%H:%M")
+                        start_iso = f"{booking_date}T{start_clock.strftime('%H:%M')}:00"
+                        if duration > 0:
+                            end_clock = start_clock + timedelta(minutes=duration)
+                            end_iso = f"{booking_date}T{end_clock.strftime('%H:%M')}:00"
+                        else:
+                            end_iso = None
+                    except ValueError:
+                        start_iso = f"{booking_date}T00:00:00"
+                        end_iso = None
+
+                    teams_link = str(b.get("teams_link") or "").strip()
+                    event_type = "teams" if teams_link else "booking"
+
+                    events.append(
+                        {
+                            "title": str(b.get("purpose") or "Meeting Booking").strip() or "Meeting Booking",
+                            "start": start_iso,
+                            "end": end_iso,
+                            "type": event_type,
+                            "festival_name": "",
+                            "slot": start_time,
+                            "status": str(b.get("status") or "").strip(),
+                            "details": str(b.get("purpose") or "").strip(),
+                            "organizer": str(b.get("organizer_email") or "").strip(),
+                            "student_email": str(b.get("student_email") or user_email).strip(),
+                            "join_url": teams_link,
+                        }
+                    )
+        except Exception as e:
+            print(f"⚠️ student_calendar_events meeting fetch failed: {e}")
+
+    events.sort(key=lambda ev: ev.get("start") or "")
+    return {"success": True, "events": events}
+
+
 @app.post("/api/student/admin/upload-file/{file_type}")
 async def admin_upload_file(
     file_type: str,

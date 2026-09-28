@@ -95,7 +95,7 @@ jobs:
           EXPECT_MAINTENANCE_NOTICE: "true"
           RUN_WRITE_TESTS: "false"
         run: |
-          pytest -v test_student_registration.py --junitxml=selenium-results.xml
+          pytest -v student_registration_smoke.py --junitxml=selenium-results.xml
 
       - name: Upload Selenium results
         if: always()
@@ -129,3 +129,4 @@ jobs:
             echo "Student Registration maintenance disable failed"
             exit 1
           fi
+

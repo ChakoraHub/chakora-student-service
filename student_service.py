@@ -5,13 +5,31 @@ Run  : uvicorn student_service:app --host 0.0.0.0 --port 8001
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Architecture : [User] → [Flask Proxy app.py] → [This Service] → [Oracle]
+                                                      ↕
+                                               [redis_service :6380]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Redis Cache Strategy (all via redis_service HTTP API)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Key                            DB  TTL      Set on           Cleared on
+  ─────────────────────────────  ──  ───────  ───────────────  ─────────────────
+  session:{user_id}               0  7 days   login            logout
+  user:{user_id}                  1  30 min   login, profile   profile update
+  roles:{user_id}                 2  1 hr     login            logout
+  student:dashboard:{user_id}     5  5 min    dashboard GET    profile/role chg
+  resources:{subject}:{lang}      3  2 hr     first fetch      —  (auto-expire)
+  resources:{subject}:files       3  2 hr     first fetch      —  (auto-expire)
+  offers:{date}                   3  1 hr     first fetch      —  (auto-expire)
+  festival:{date}                 3  24 hr    first fetch      —  (auto-expire)
+  feedbacks:latest                3  10 min   first fetch      new submission
+  registration:{user_id}          3  5 min    first fetch      —  (auto-expire)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import uvicorn
 import traceback
+import redis
 import oracledb
 import os, json, uuid, httpx
-import secrets
-from pathlib import Path
 import boto3
 import mimetypes
 import shutil
@@ -46,6 +64,7 @@ INTERNSHIP_SERVICE_URL = os.getenv("INTERNSHIP_SERVICE_URL","http://localhost:50
 MS365_SERVICE_URL = os.getenv("MS365_SERVICE_URL","http://localhost:7700")
 EMPLOYEE_SERVICE_URL = os.getenv("EMPLOYEE_SERVICE_URL","http://localhost:8002")
 BLOGGER_SERVICE_URL = os.getenv("BLOGGER_SERVICE_URL","http://localhost:7500")
+REDIS_SERVICE_URL = os.getenv("REDIS_SERVICE_URL","http://localhost:6390")
 BRS_SERVICE_URL = os.getenv("BRS_SERVICE_URL","http://localhost:8020")
 LAMBDA_URL = 'https://lwug4xhfz27whiuu3acjfwsgtm0ttwja.lambda-url.eu-north-1.on.aws/'
 STATIC_CDN = "https://d1pjjckqswt5z7.cloudfront.net"
@@ -58,46 +77,6 @@ FEEDBACK_BASE_URL = os.getenv("FEEDBACK_BASE_URL", "http://127.0.0.1:8282/feedba
 
 
 app = FastAPI(title="Student Service", version="3.0")
-
-# ================= STUDENT REGISTRATION MAINTENANCE =================
-# Persist the flag outside normal application state so a deployment restart
-# does not automatically clear maintenance mode.
-MAINTENANCE_FLAG = Path(
-    os.getenv(
-        "MAINTENANCE_FLAG",
-        str(Path(__file__).resolve().parent / "static" / "student-registration-maintenance.flag"),
-    )
-)
-MAINTENANCE_TOKEN = os.getenv("MAINTENANCE_TOKEN")
-
-def is_maintenance_enabled() -> bool:
-    return MAINTENANCE_FLAG.exists()
-
-def verify_maintenance_token(request: Request):
-    authorization = request.headers.get("Authorization", "")
-    supplied_token = authorization.removeprefix("Bearer ").strip()
-    if not MAINTENANCE_TOKEN or not secrets.compare_digest(
-        supplied_token, MAINTENANCE_TOKEN
-    ):
-        raise HTTPException(status_code=401, detail="Invalid maintenance token")
-
-@app.get("/api/student/maintenance/status")
-async def student_registration_maintenance_status():
-    return {"maintenance_mode": is_maintenance_enabled()}
-
-@app.post("/admin/maintenance/on")
-async def enable_student_registration_maintenance(request: Request):
-    verify_maintenance_token(request)
-    MAINTENANCE_FLAG.parent.mkdir(parents=True, exist_ok=True)
-    MAINTENANCE_FLAG.touch(exist_ok=True)
-    return {"success": True, "maintenance_mode": True}
-
-@app.post("/admin/maintenance/off")
-async def disable_student_registration_maintenance(request: Request):
-    verify_maintenance_token(request)
-    MAINTENANCE_FLAG.unlink(missing_ok=True)
-    return {"success": True, "maintenance_mode": False}
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -114,9 +93,13 @@ app.add_middleware(
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
+REDIS_SVC = os.getenv("REDIS_SERVICE_URL", "http://localhost:6390")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REGISTRATION_STREAM_NAME = os.getenv("REGISTRATION_STREAM_NAME", "registration_stream")
 
-# TTL constants
+# TTL constants (must match redis_service.py)
 TTL_SESSION      = 604_800   # 7 days
 TTL_PROFILE      = 1_800     # 30 min
 TTL_AUTH         = 3_600     # 1 hr
@@ -194,17 +177,6 @@ COURSE_NAME_MAP = {
     "snowflake":                  "Snowflake",
 }
 
-COURSE_CARD_IMAGE_COLUMN_CANDIDATES = [
-    "IMAGE_S3_URL",
-    "COURSE_IMAGE_URL",
-    "IMAGE_URL",
-    "THUMBNAIL_URL",
-    "COURSE_THUMBNAIL_URL",
-    "S3_URL",
-    "COURSE_URL",
-    "URL",
-]
-
 SERVICE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_ROOT = os.path.join(SERVICE_DIR, "uploads")
 PRACTICE_TESTS_FOLDER = os.path.join(UPLOAD_ROOT, "practice_tests")
@@ -227,61 +199,49 @@ ALLOWED_EXTENSIONS = {
 }
 
 # ─────────────────────────────────────────────
-# CACHE BACKEND (local no-op compatible stub)
+# REDIS HTTP HELPER  — fire-and-forget safe
+# Any Redis failure is non-fatal; service falls back to Oracle.
 # ─────────────────────────────────────────────
-_LOCAL_CACHE: Dict[str, Any] = {}
+def _redis_service_candidates() -> List[str]:
+    base = (REDIS_SVC or "http://localhost:6380").rstrip("/")
+    candidates = [base]
+    if base.endswith(":6380"):
+        candidates.append(base[:-5] + ":6390")
+    elif base.endswith(":6390"):
+        candidates.append(base[:-5] + ":6380")
+    else:
+        candidates.extend(["http://localhost:6380", "http://127.0.0.1:6380"])
+
+    # Deduplicate while preserving order.
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
 
 
-def _cache_set(key: str, value: Any) -> None:
-    _LOCAL_CACHE[key] = value
-
-
-def _cache_get(key: str) -> Optional[Any]:
-    return _LOCAL_CACHE.get(key)
-
-
-def _cache_delete(key: str) -> None:
-    _LOCAL_CACHE.pop(key, None)
+def _redis(method: str, path: str, **kwargs) -> Optional[Dict]:
+    for base_url in _redis_service_candidates():
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                fn = {"GET": client.get, "POST": client.post, "DELETE": client.delete}.get(method)
+                if fn is None:
+                    return None
+                resp = fn(f"{base_url}{path}", **kwargs)
+                resp.raise_for_status()
+                return resp.json()
+        except Exception as exc:
+            print(f"⚠️  redis_service {method} {path} @ {base_url} → {exc}")
+            continue
+    return None
 
 
 def _json_default(value):
     if isinstance(value, Decimal):
         return int(value) if value % 1 == 0 else float(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
-
-def _resolve_course_card_image_column(cursor) -> Optional[str]:
-    """Resolve the optional course image URL column added to NRM_COURSES."""
-    try:
-        cursor.execute(
-            """
-            SELECT COLUMN_NAME
-            FROM USER_TAB_COLUMNS
-            WHERE TABLE_NAME = 'NRM_COURSES'
-            """
-        )
-        user_cols = {(row.get("COLUMN_NAME") or "").upper() for row in (cursor.fetchall() or [])}
-    except Exception:
-        user_cols = set()
-
-    if not user_cols:
-        try:
-            cursor.execute(
-                """
-                SELECT COLUMN_NAME
-                FROM ALL_TAB_COLUMNS
-                WHERE OWNER = 'CHAKORA' AND TABLE_NAME = 'NRM_COURSES'
-                """
-            )
-            user_cols = {(row.get("COLUMN_NAME") or "").upper() for row in (cursor.fetchall() or [])}
-        except Exception:
-            user_cols = set()
-
-    for col in COURSE_CARD_IMAGE_COLUMN_CANDIDATES:
-        if col in user_cols:
-            return col
-    return None
-
 
 # Kafka Consumer helper function
 
@@ -332,7 +292,28 @@ def _run_lookup_consumer():
         try:
             normalized = identity.lower().strip()
 
-            # Cache is disabled; perform direct lookup.
+            # ── STEP 1: Redis cache check ───────────────────────
+            cache_key = f"meeting:user:{normalized}"
+            cache_resp = _redis("GET", "/redis/get", params={"key": cache_key, "db": 8})
+            if cache_resp and cache_resp.get("success") and cache_resp.get("found"):
+                try:
+                    bookings = json.loads(cache_resp.get("value") or "[]")
+                except Exception:
+                    bookings = []
+                latest = bookings[0] if bookings else {}
+                result_payload.update({
+                    "exists":        True,
+                    "source":        "redis",
+                    "student_email": latest.get("student_email"),
+                    "student_phone": latest.get("student_phone"),
+                    "student_name":  latest.get("student_name"),
+                    "total_bookings": len(bookings),
+                    "ml_suggestion": generate_ml_suggestion(bookings)
+                })
+                kafka_publish("student.lookup.completed", result_payload)
+                continue   # ← next Kafka message
+
+            # ── STEP 2: DynamoDB lookup ─────────────────────────
             dynamodb = boto3.resource(
                 "dynamodb",
                 region_name=os.getenv("AWS_REGION", "eu-north-1"),
@@ -354,6 +335,11 @@ def _run_lookup_consumer():
 
             if bookings:
                 latest = bookings[0] if bookings else {}
+                _redis(
+                    "POST",
+                    "/redis/set",
+                    json={"key": f"meeting:user:{normalized}", "value": json.dumps(bookings, default=_json_default), "db": 8, "ttl": 120},
+                )
                 result_payload.update({
                     "exists":        True,
                     "source":        "dynamodb",
@@ -373,77 +359,87 @@ def _run_lookup_consumer():
         kafka_publish("student.lookup.completed", result_payload)
 
 # ─────────────────────────────────────────────
-# CACHE HELPERS
+# CACHE HELPERS — each one is a thin wrapper
+# matching the canonical key names exactly.
 # ─────────────────────────────────────────────
 
 # ── 1. Session  (key: session:{user_id}) ──────────────────
 def cache_session_set(user_id: int, data: dict) -> None:
-    _cache_set(f"session:{user_id}", data)
+    _redis("POST", "/session/set", json={"user_id": user_id, "data": data, "ttl": TTL_SESSION})
 
 def cache_session_get(user_id: int) -> Optional[dict]:
-    value = _cache_get(f"session:{user_id}")
-    return value if isinstance(value, dict) else None
+    r = _redis("GET", "/session/get", params={"user_id": user_id})
+    return r["data"] if r and r.get("found") else None
 
 def cache_session_delete(user_id: int) -> None:
-    _cache_delete(f"session:{user_id}")
+    _redis("DELETE", "/session/delete", params={"user_id": user_id})
 
 def cache_session_refresh(user_id: int) -> None:
-    """No-op for local cache backend."""
-    _ = user_id
+    """Slide TTL on every authenticated request (keep-alive)."""
+    _redis("POST", "/session/refresh", params={"user_id": user_id, "ttl": TTL_SESSION})
 
 
 # ── 2. User Profile  (key: user:{user_id}) ────────────────
 def cache_profile_set(user_id: int, data: dict) -> None:
-    _cache_set(f"user:{user_id}", data)
+    _redis("POST", "/profile/set", json={"user_id": user_id, "data": data, "ttl": TTL_PROFILE})
 
 def cache_profile_get(user_id: int) -> Optional[dict]:
-    value = _cache_get(f"user:{user_id}")
-    return value if isinstance(value, dict) else None
+    r = _redis("GET", "/profile/get", params={"user_id": user_id})
+    return r["data"] if r and r.get("found") else None
 
 def cache_profile_delete(user_id: int) -> None:
-    _cache_delete(f"user:{user_id}")
+    _redis("DELETE", "/profile/delete", params={"user_id": user_id})
 
 
 # ── 3. Auth / Roles  (key: roles:{user_id}) ──────────────
 def cache_auth_set(user_id: int, roles: list, usertype: str) -> None:
-    _cache_set(f"roles:{user_id}", {"roles": roles, "usertype": usertype})
+    _redis("POST", "/auth/set", json={"user_id": user_id, "roles": roles,
+                                      "usertype": usertype, "ttl": TTL_AUTH})
 
 def cache_auth_get(user_id: int) -> Optional[dict]:
-    value = _cache_get(f"roles:{user_id}")
-    return value if isinstance(value, dict) else None
+    r = _redis("GET", "/auth/get", params={"user_id": user_id})
+    return r["data"] if r and r.get("found") else None
 
 def cache_auth_delete(user_id: int) -> None:
-    _cache_delete(f"roles:{user_id}")
+    _redis("DELETE", "/auth/delete", params={"user_id": user_id})
 
 
 # ── 4. Frequent Data  (caller-defined keys, DB 3) ────────
 def cache_freq_set(key: str, data: Any, ttl: int) -> None:
-    _ = ttl
-    _cache_set(key, data)
+    _redis("POST", "/freq/set", json={"key": key, "data": data, "ttl": ttl})
 
 def cache_freq_get(key: str) -> Optional[Any]:
-    return _cache_get(key)
+    r = _redis("GET", "/freq/get", params={"key": key})
+    return r["data"] if r and r.get("found") else None
 
 def cache_freq_delete(key: str) -> None:
-    _cache_delete(key)
+    _redis("DELETE", "/freq/delete", params={"key": key})
 
 
 # ── 5. Rate Limit check ──────────────────────────────────
 def rate_limit_ok(identifier: str, endpoint: str) -> bool:
-    """Returns True = allowed (rate limiting disabled)."""
-    _ = (identifier, endpoint)
-    return True
+    """Returns True = allowed, False = blocked. Fails open."""
+    cfg = RATE_LIMITS.get(endpoint, {"limit": 30, "window": 60})
+    r = _redis("POST", "/ratelimit/check", params={
+        "identifier": identifier, "endpoint": endpoint,
+        "limit": cfg["limit"], "window": cfg["window"],
+    })
+    return r.get("allowed", True) if r else True
 
 
 # ── 6. Dashboard/API Response Cache  (key: student:dashboard:{user_id}) ─
 def cache_dashboard_set(user_id: int, data: Any) -> None:
-    _cache_set(f"student:dashboard:{user_id}", data)
+    _redis("POST", "/apicache/set", json={
+        "cache_key": f"student:dashboard:{user_id}",
+        "response": data, "ttl": TTL_DASHBOARD,
+    })
 
 def cache_dashboard_get(user_id: int) -> Optional[Any]:
-    return _cache_get(f"student:dashboard:{user_id}")
+    r = _redis("GET", "/apicache/get", params={"cache_key": f"student:dashboard:{user_id}"})
+    return r["data"] if r and r.get("found") else None
 
 def cache_dashboard_delete(user_id: int) -> None:
-    _cache_delete(f"student:dashboard:{user_id}")
+    _redis("DELETE", "/apicache/delete", params={"cache_key": f"student:dashboard:{user_id}"})
 
 
 # ─────────────────────────────────────────────
@@ -573,7 +569,6 @@ class FeedbackRequest(BaseModel):
     feedback_text: str
     rating: Optional[int] = None   # 1–5 stars
     meeting_id: Optional[str] = None  # NEW: optional meeting ID
-    request_id: Optional[str] = None
 
 class EnquiryRequest(BaseModel):
     name: str
@@ -595,7 +590,7 @@ class StudentRegistrationRequest(BaseModel):
     course: int
     offering_id: int
     language: int
-    start_date: Optional[str] = None
+    start_date: str
     payment_id: Optional[str] = None
     order_id: Optional[str] = None
     signature: Optional[str] = None
@@ -614,25 +609,15 @@ class StudentRegistrationRequest(BaseModel):
     resume_s3_key: Optional[str] = None
 
 # ── NEW models for feedback generation ──────────────────
-class FeedbackActivity(BaseModel):
-    activity_type: str
-    activity_id: str
-    label: str
-
 class FeedbackGenerateRequest(BaseModel):
+    meeting_id: str
     student_email: EmailStr
     student_name: str
-    activities: List[FeedbackActivity]
+    booking_id: Optional[str] = None
     expiry_hours: float = 24.0
 
 class FeedbackFormRequest(BaseModel):
-    request_id: Optional[str] = None
-    meeting_id: Optional[str] = None
-    name: str
-    email: EmailStr
-    phone: str
-    feedback_text: str
-    rating: Optional[int] = None
+    meeting_id: str
 
 # ── NEW: Jinja2 templates setup ─────────────────────────
 # We'll use an in-memory HTML template string for simplicity,
@@ -905,12 +890,13 @@ async def health_check():
     db_ok = conn is not None
     if conn:
         conn.close()
+    redis_ok = _redis("GET", "/health") is not None
     return {
         "status":    "healthy",
         "service":   "student-service",
         "version":   "3.0",
         "database":  "connected" if db_ok else "disconnected",
-        "cache":     "disabled",
+        "redis":     "connected" if redis_ok else "unavailable",
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -1008,74 +994,6 @@ async def admin_courses():
         return cursor.fetchall() or []
     except Exception as e:
         print(f"❌ admin_courses error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.get("/api/student/resources-courses")
-async def resources_courses():
-    """Return active course cards for Website resources grid.
-
-    Uses the optional 4th URL/image column from NRM_COURSES when available.
-    """
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cursor = conn.cursor(DictCursor)
-    try:
-        image_col = _resolve_course_card_image_column(cursor)
-        print(f"[resources_courses] resolved image column: {image_col or 'NONE'}")
-
-        if image_col:
-            query = f"""
-                SELECT
-                    c.ID,
-                    c.COURSE_NAME,
-                    c.COURSE_CODE,
-                    c.{image_col} AS IMAGE_URL
-                FROM NRM_COURSES c
-                ORDER BY c.COURSE_NAME
-            """
-        else:
-            query = """
-                SELECT
-                    c.ID,
-                    c.COURSE_NAME,
-                    c.COURSE_CODE,
-                    '' AS IMAGE_URL
-                FROM NRM_COURSES c
-                ORDER BY c.COURSE_NAME
-            """
-
-        cursor.execute(query)
-        rows = cursor.fetchall() or []
-
-        courses = []
-        for idx, row in enumerate(rows, start=1):
-            course_name = str(row.get("COURSE_NAME") or "").strip()
-            if not course_name:
-                continue
-
-            courses.append(
-                {
-                    "id": row.get("ID"),
-                    "course_code": row.get("COURSE_CODE") or "",
-                    "subject": course_name,
-                    "sub_id": f"sub{idx}",
-                    "image_url": (row.get("IMAGE_URL") or "").strip(),
-                }
-            )
-
-        return {
-            "success": True,
-            "courses": courses,
-            "image_column": image_col or "",
-        }
-    except Exception as e:
-        print(f"❌ resources_courses error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         cursor.close()
@@ -1439,7 +1357,7 @@ async def get_shop_courses():
     """
     Returns the active course catalogue with live pricing from Oracle PRICING_LOOKUP.
     Called by app.py /api/shop/courses to replace the hardcoded PRODUCTS array.
-    Cached for 30 minutes under key shop:courses.
+    Cached in Redis for 30 minutes under key shop:courses.
     """
     CACHE_KEY = "shop:courses"
     cached = cache_freq_get(CACHE_KEY)
@@ -1694,13 +1612,14 @@ async def student_login(payload: LoginRequest):
         }
         cache_profile_set(user_id, profile_data)     # user:{user_id}     30 min
         # Resources page profile cache
-        _cache_set(
-            f"resources:session:{user_id}",
-            {
+        _redis(
+            "POST",
+            "/resources/session/set",
+            json={
                 "user_id": str(user_id),
                 "username": email or phone,
                 "usertype": usertype,
-                "profile_pic": pic,
+                "profile_pic": pic
             },
         )
         cache_auth_set(user_id, roles, usertype)     # roles:{user_id}    1 hr
@@ -1866,15 +1785,13 @@ async def student_registration(payload: StudentRegistrationRequest):
         raise HTTPException(status_code=400, detail="Invalid course or language selection.")
 
     if not start_date_raw:
-        # Backward compatibility: older website payloads do not send start_date.
-        start_date = datetime.now()
-    else:
-        try:
-            start_date = datetime.strptime(start_date_raw, "%Y-%m-%d")
-            if start_date.date() < datetime.now().date():
-                raise HTTPException(status_code=400, detail="Start date cannot be in the past.")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+        raise HTTPException(status_code=400, detail="Start date is required.")
+    try:
+        start_date = datetime.strptime(start_date_raw, "%Y-%m-%d")
+        if start_date.date() < datetime.now().date():
+            raise HTTPException(status_code=400, detail="Start date cannot be in the past.")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
     conn = get_db_connection()
     if not conn:
@@ -1984,9 +1901,9 @@ async def student_registration(payload: StudentRegistrationRequest):
         cursor.execute(
             """
             INSERT INTO NRM_REGISTRATIONS
-            (REGISTRATION_ID, STUDENT_ID, COURSE_ID, LANGUAGE_ID, STATUS_ID, CREATED_DT, OFFERING_ID,
+            (REGISTRATION_ID, STUDENT_ID, COURSE_ID, LANGUAGE_ID, START_DATE, STATUS_ID, CREATED_DT, OFFERING_ID,
              QUALIFICATION, COLLEGE, BRANCH, PASSING_YEAR, EXPERIENCE, RESUME_FILE_NAME, RESUME_S3_KEY, RESUME_UPLOADED_AT)
-            VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s,
+            VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s,
                     %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
             """,
             (
@@ -1994,6 +1911,7 @@ async def student_registration(payload: StudentRegistrationRequest):
                 student_id,
                 course_id,
                 language_id,
+                start_date,
                 active_id,
                 offering_id,
                 qualification,
@@ -2007,24 +1925,32 @@ async def student_registration(payload: StudentRegistrationRequest):
         )
         conn.commit()
 
-        kafka_publish("registration.completed", {
-            "event_id": str(uuid.uuid4()),
-            "event_type": "registration.completed",
-            "timestamp": datetime.utcnow().isoformat(),
-            "registration_id": reg_id,
-            "user_id": user_id,
-            "student_name": f"{first_name} {last_name}".strip(),
-            "student_email": email,
-            "course_name": course_name,
-            "course_id": course_id,
-            "offering_id": offering_id,
-            "language_id": language_id,
-            "payment_id": payment_id,
-            "order_id": order_id,
-            "payment_amount": course_fee,
-            "registration_type": registration_type,
-        })
-        print(f"✅ Published registration.completed | reg_id={reg_id} user_id={user_id}")
+        try:
+            redis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                db=REDIS_DB,
+                decode_responses=False,
+            ).xadd(
+                REGISTRATION_STREAM_NAME,
+                {
+                    "registration_id": reg_id,
+                    "user_id": str(user_id),
+                    "student_id": str(student_id),
+                    "payment_id": payment_id,
+                    "order_id": order_id,
+                    "course_id": str(course_id),
+                    "course_name": course_name,
+                    "payment_amount": str(course_fee),
+                    "student_name": f"{first_name} {last_name}",
+                    "student_email": email,
+                    "language_id": str(language_id),
+                    "start_date": start_date_raw,
+                },
+            )
+            print(f"✅ Registration event pushed to Redis stream: {reg_id}")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not push to Redis stream: {e}")
 
         return {
             "success": True,
@@ -2684,26 +2610,23 @@ async def submit_feedback(payload: FeedbackRequest):
     try:
         cursor = conn.cursor(DictCursor)
 
-        # ── NEW: If request_id or meeting_id is provided, validate request ──────────────
-        request_id = payload.request_id or payload.meeting_id
-        if request_id:
+        # ── NEW: If meeting_id is provided, validate request ──────────────
+        if payload.meeting_id:
             cursor.execute(
                 """
-                SELECT request_id, meeting_id, expiry_time, feedback_sent
+                SELECT meeting_id, expiry_time, feedback_sent
                 FROM NRM_FEEDBACK_REQUESTS
-                WHERE request_id = %s OR meeting_id = %s
+                WHERE meeting_id = %s
                 """,
-                (request_id, request_id)
+                (payload.meeting_id,)
             )
             req = cursor.fetchone()
             if not req:
-                raise HTTPException(status_code=400, detail="Invalid feedback request ID")
+                raise HTTPException(status_code=400, detail="Invalid meeting ID")
             expiry = req["EXPIRY_TIME"]
             if datetime.utcnow() > expiry:
                 raise HTTPException(status_code=400, detail="Feedback window expired")
-            # FEEDBACK_SENT is stored as NUMBER(1) in Oracle (0 = False, 1 = True)
-            sent_val = req.get("FEEDBACK_SENT")
-            if sent_val == 1 or sent_val is True:
+            if req.get("FEEDBACK_SENT"):
                 raise HTTPException(status_code=400, detail="Feedback already submitted")
 
         # ── Step 1: Find student_id via NRM_USERS → NRM_STUDENTS (USER_ID) ──
@@ -2730,28 +2653,24 @@ async def submit_feedback(payload: FeedbackRequest):
             print(f"ℹ️  No registered student found for email={payload.email} — saving feedback with STUDENT_ID=NULL")
 
         # ── Step 2: Insert feedback (STUDENT_ID can be NULL for guest submitters) ──
-        # Also store meeting_id and request_id if present
+        # Also store meeting_id if present
         cursor.execute(
             """
-            INSERT INTO NRM_FEEDBACK (STUDENT_ID, NAME, EMAIL, PHONE, FEEDBACK_MESSAGE, RATING, MEETING_ID, REQUEST_ID, SUBMITTED_AT)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            INSERT INTO NRM_FEEDBACK (STUDENT_ID, NAME, EMAIL, PHONE, FEEDBACK_MESSAGE, RATING, MEETING_ID, SUBMITTED_AT)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
             """,
-            (student_id, payload.name, payload.email, payload.phone, payload.feedback_text, payload.rating, request_id, request_id),
+            (student_id, payload.name, payload.email, payload.phone, payload.feedback_text, payload.rating, payload.meeting_id),
         )
         conn.commit()
 
-        # ── Step 3: If request_id exists, mark request as sent ────────────────────────────
-        if request_id:
+        # ── Step 3: If meeting_id, mark request as sent ────────────────────────────
+        if payload.meeting_id:
             cursor.execute(
-                """
-                UPDATE NRM_FEEDBACK_REQUESTS
-                SET feedback_sent = 1
-                WHERE request_id = %s OR meeting_id = %s
-                """,
-                (request_id, request_id)
+                "UPDATE NRM_FEEDBACK_REQUESTS SET feedback_sent = TRUE WHERE meeting_id = %s",
+                (payload.meeting_id,)
             )
             conn.commit()
-            print(f"✅ Marked feedback as sent for request {request_id}")
+            print(f"✅ Marked feedback as sent for meeting {payload.meeting_id}")
 
         # ── Step 4: Invalidate feedbacks cache ────────────────────────────
         
@@ -2896,136 +2815,6 @@ async def get_roles(user_id: int):
     finally:
         cursor.close()
         conn.close()
-
-
-@app.get("/api/student/calendar-events")
-async def student_calendar_events(
-    start: str,
-    end: str,
-    email: Optional[str] = None,
-    phone: Optional[str] = None,
-):
-    """Return normalized calendar events for mobile calendar screen.
-
-    Combines:
-    - Festivals from NRM_FESTIVALS
-    - User meetings from meeting_service (if email/phone provided)
-    """
-    try:
-        start_date = datetime.strptime(start, "%Y-%m-%d").date()
-        end_date = datetime.strptime(end, "%Y-%m-%d").date()
-        if end_date < start_date:
-            raise HTTPException(status_code=400, detail="end must be on/after start")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
-
-    events = []
-
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cursor = conn.cursor(DictCursor)
-    try:
-        cursor.execute(
-            """
-            SELECT FESTIVAL_NAME, FESTIVAL_DATE
-            FROM NRM_FESTIVALS
-            WHERE FESTIVAL_DATE BETWEEN %s AND %s
-            ORDER BY FESTIVAL_DATE ASC
-            """,
-            (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
-        )
-        festival_rows = cursor.fetchall() or []
-
-        for row in festival_rows:
-            festival_name = str(row.get("FESTIVAL_NAME") or "Festival").strip()
-            festival_date = row.get("FESTIVAL_DATE")
-            if hasattr(festival_date, "strftime"):
-                start_iso = festival_date.strftime("%Y-%m-%d")
-            else:
-                start_iso = str(festival_date)
-
-            events.append(
-                {
-                    "title": festival_name,
-                    "start": f"{start_iso}T00:00:00",
-                    "end": None,
-                    "type": "festival",
-                    "festival_name": festival_name,
-                    "slot": "",
-                    "status": "",
-                    "details": "",
-                    "organizer": "",
-                    "student_email": "",
-                    "join_url": "",
-                }
-            )
-    finally:
-        cursor.close()
-        conn.close()
-
-    user_email = (email or "").strip().lower()
-    user_phone = (phone or "").strip()
-    if user_email or user_phone:
-        try:
-            params = {"email": user_email} if user_email else {"phone": user_phone}
-            resp = requests.get(f"{MEETING_SERVICE_URL}/meeting/user-bookings", params=params, timeout=10)
-            payload = resp.json() if resp.status_code == 200 else {}
-            bookings = payload.get("bookings") if isinstance(payload, dict) else []
-            if isinstance(bookings, list):
-                for b in bookings:
-                    if not isinstance(b, dict):
-                        continue
-
-                    booking_date = str(b.get("booking_date") or "").strip()
-                    if not booking_date:
-                        continue
-                    try:
-                        booking_dt = datetime.strptime(booking_date, "%Y-%m-%d").date()
-                    except ValueError:
-                        continue
-                    if booking_dt < start_date or booking_dt > end_date:
-                        continue
-
-                    start_time = str(b.get("start_time") or "09:00").strip()
-                    duration = int(b.get("duration_minutes") or 0)
-
-                    try:
-                        start_clock = datetime.strptime(start_time, "%H:%M")
-                        start_iso = f"{booking_date}T{start_clock.strftime('%H:%M')}:00"
-                        if duration > 0:
-                            end_clock = start_clock + timedelta(minutes=duration)
-                            end_iso = f"{booking_date}T{end_clock.strftime('%H:%M')}:00"
-                        else:
-                            end_iso = None
-                    except ValueError:
-                        start_iso = f"{booking_date}T00:00:00"
-                        end_iso = None
-
-                    teams_link = str(b.get("teams_link") or "").strip()
-                    event_type = "teams" if teams_link else "booking"
-
-                    events.append(
-                        {
-                            "title": str(b.get("purpose") or "Meeting Booking").strip() or "Meeting Booking",
-                            "start": start_iso,
-                            "end": end_iso,
-                            "type": event_type,
-                            "festival_name": "",
-                            "slot": start_time,
-                            "status": str(b.get("status") or "").strip(),
-                            "details": str(b.get("purpose") or "").strip(),
-                            "organizer": str(b.get("organizer_email") or "").strip(),
-                            "student_email": str(b.get("student_email") or user_email).strip(),
-                            "join_url": teams_link,
-                        }
-                    )
-        except Exception as e:
-            print(f"⚠️ student_calendar_events meeting fetch failed: {e}")
-
-    events.sort(key=lambda ev: ev.get("start") or "")
-    return {"success": True, "events": events}
 
 
 @app.post("/api/student/admin/upload-file/{file_type}")
@@ -3224,7 +3013,7 @@ async def student_lookup(
     """
     Student identity lookup
     Flow:
-    Direct DynamoDB lookup
+    Redis Cache -> DynamoDB
     """
     try:
         normalized_query = query.strip().lower()
@@ -3239,7 +3028,35 @@ async def student_lookup(
                 }
             )
 
-        # Cache is disabled; always query DB.
+        # STEP 1 — REDIS CACHE LOOKUP
+        cache_key = f"meeting:user:{normalized_query}"
+        cache_resp = _redis("GET", "/redis/get", params={"key": cache_key, "db": 8})
+        if cache_resp and cache_resp.get("success") and cache_resp.get("found"):
+            try:
+                bookings = json.loads(cache_resp.get("value") or "[]")
+            except Exception:
+                bookings = []
+            print(f"🎯 Cache HIT for: {normalized_query}")
+            latest_booking = bookings[0] if bookings else {}
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "exists": True,
+                    "cache_hit": True,
+                    "source": "redis",
+                    "query_type": query_type,
+                    "student_email": latest_booking.get("student_email"),
+                    "student_phone": latest_booking.get("student_phone"),
+                    "student_name": latest_booking.get("student_name"),
+                    "total_bookings": len(bookings),
+                    "bookings": bookings,
+                    "ml_suggestion": generate_ml_suggestion(bookings)
+                }
+            )
+
+        # STEP 2 — CACHE MISS → DYNAMODB
+        print(f"❌ Cache MISS for: {normalized_query}")
         bookings = query_dynamo_bookings(normalized_query)
 
         # STEP 3 — NEW USER
@@ -3258,7 +3075,15 @@ async def student_lookup(
                 }
             )
 
-        # Existing user response
+        # STEP 4 — CACHE WARMING
+        _redis(
+            "POST",
+            "/redis/set",
+            json={"key": f"meeting:user:{normalized_query}", "value": json.dumps(bookings), "db": 8, "ttl": 120},
+        )
+        print(f"📝 Cache warmed for: {normalized_query}")
+
+        # STEP 5 — EXISTING USER RESPONSE
         latest_booking = bookings[0] if bookings else {}
 
         return JSONResponse(
@@ -3297,9 +3122,9 @@ async def student_lookup(
 @app.post("/api/student/feedback/generate")
 async def generate_feedback_link(payload: FeedbackGenerateRequest):
     """
-    Generate feedback links for one or more student activities.
-    - Stores expiry and request_id in Oracle (NRM_FEEDBACK_REQUESTS)
-    - Sends email to student with the links
+    Generate a feedback link for a completed meeting.
+    - Stores expiry in Oracle (NRM_FEEDBACK_REQUESTS)
+    - Sends email to student with the link
     """
     conn = get_db_connection()
     if not conn:
@@ -3308,80 +3133,115 @@ async def generate_feedback_link(payload: FeedbackGenerateRequest):
     cursor = None
     try:
         cursor = conn.cursor(DictCursor)
+
+        # 1. Compute expiry
         expiry_time = datetime.utcnow() + timedelta(hours=payload.expiry_hours)
+        meeting_id = payload.meeting_id
         student_email = payload.student_email
         student_name = payload.student_name
 
-        generated_links = []
-        for act in payload.activities:
-            import uuid
-            # Generate a secure request token / request_id
-            request_id = f"REQ-{uuid.uuid4().hex[:12].upper()}"
-            feedback_url = f"{FEEDBACK_BASE_URL}?request_id={request_id}"
+        # 2. Check if meeting already has a request
+        print(f"🔍 Checking NRM_FEEDBACK_REQUESTS for meeting_id={meeting_id}")
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS CNT
+            FROM NRM_FEEDBACK_REQUESTS
+            WHERE MEETING_ID = %s
+            """,
+            (meeting_id,)
+        )
+        row = cursor.fetchone()
+        exists = row["CNT"] > 0 if row else False
+        print(f"   exists={exists}")
 
-            # Insert into NRM_FEEDBACK_REQUESTS
-            # MEETING_ID acts as the PRIMARY KEY legacy mapping, REQUEST_ID holds the new dedicated request token
+        # 3. Insert or update
+        if exists:
+            cursor.execute(
+                """
+                UPDATE NRM_FEEDBACK_REQUESTS
+                SET
+                    STUDENT_EMAIL = %s,
+                    STUDENT_NAME = %s,
+                    EXPIRY_TIME = %s,
+                    CREATED_AT = CURRENT_TIMESTAMP,
+                    FEEDBACK_SENT = FALSE
+                WHERE MEETING_ID = %s
+                """,
+                (student_email, student_name, expiry_time, meeting_id)
+            )
+        else:
             cursor.execute(
                 """
                 INSERT INTO NRM_FEEDBACK_REQUESTS
-                (MEETING_ID, REQUEST_ID, STUDENT_EMAIL, STUDENT_NAME, EXPIRY_TIME, CREATED_AT, FEEDBACK_SENT, FEEDBACK_URL, ACTIVITY_TYPE, ACTIVITY_ID)
-                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, 0, %s, %s, %s)
+                (MEETING_ID, STUDENT_EMAIL, STUDENT_NAME, EXPIRY_TIME, CREATED_AT, FEEDBACK_SENT)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, FALSE)
                 """,
-                (request_id, request_id, student_email, student_name, expiry_time, feedback_url, act.activity_type, act.activity_id)
+                (meeting_id, student_email, student_name, expiry_time)
             )
-
-            generated_links.append({
-                "activity_type": act.activity_type,
-                "activity_id": act.activity_id,
-                "label": act.label,
-                "request_id": request_id,
-                "feedback_url": feedback_url
-            })
-
-            # Send email
-            try:
-                send_feedback_link_email(
-                    to_email=student_email,
-                    student_name=student_name,
-                    meeting_id=request_id,
-                    feedback_url=feedback_url,
-                    expiry=expiry_time
-                )
-            except Exception as e:
-                print(f"[WARNING] Email send failed for request {request_id}: {e}")
-
-        # Invalidate student activities cache
-        try:
-            cursor.execute(
-                """
-                SELECT r.REGISTRATION_ID 
-                FROM NRM_REGISTRATIONS r 
-                JOIN NRM_STUDENTS s ON r.STUDENT_ID = s.ID 
-                JOIN NRM_USERS u ON s.USER_ID = u.ID 
-                WHERE LOWER(TRIM(u.EMAIL)) = LOWER(TRIM(%s))
-                """, 
-                (student_email,)
-            )
-            reg_row = cursor.fetchone()
-            if reg_row:
-                reg_id = reg_row["REGISTRATION_ID"]
-                cache_key = f"chakorahub:student:activities:{reg_id}"
-                print(f"[cache] Evicted activities cache for key: {cache_key} (feedback generated)")
-        except Exception as e:
-            print(f"[WARNING] Failed to evict activities cache: {e}")
-
         conn.commit()
+        print(f"✅ Feedback request stored/updated for meeting {meeting_id}")
+
+        # 4. Build feedback URL
+        feedback_url = f"{FEEDBACK_BASE_URL}?meeting_id={meeting_id}"
+        print("=" * 70)
+        print("Generated Feedback URL")
+        print(feedback_url)
+        print("=" * 70)
+
+        cursor.execute("""
+        UPDATE NRM_FEEDBACK_REQUESTS
+        SET FEEDBACK_URL = %s
+        WHERE MEETING_ID = %s
+        """,
+        (
+            feedback_url,
+            meeting_id
+        ))
+        conn.commit()
+        print(f"✅ Feedback URL stored in Oracle for meeting {meeting_id}")
+
+        # 5. Send email
+        try:
+            print("=" * 70)
+            print("Preparing Feedback Email")
+            print(f"Meeting ID : {meeting_id}")
+            print(f"Student    : {student_name}")
+            print(f"Email      : {student_email}")
+            print(f"Feedback URL : {feedback_url}")
+            print("=" * 70)
+
+            print("📧 Email send started")
+            response = send_feedback_link_email(
+                to_email=student_email,
+                student_name=student_name,
+                meeting_id=meeting_id,
+                feedback_url=feedback_url,
+                expiry=expiry_time
+            )
+
+            print("=" * 70)
+            print("AWS SES accepted email")
+            print(response)
+            print("=" * 70)
+            print("✅ SES response received")
+        except Exception:
+            import traceback
+            print("Feedback generation failed")
+            traceback.print_exc()
+            raise
+
+        print("✅ API completed successfully")
         return {
             "success": True,
-            "message": f"Successfully generated {len(generated_links)} feedback request(s)",
-            "requests": generated_links
+            "message": "Feedback link generated and email sent",
+            "feedback_url": feedback_url,
+            "expiry_time": expiry_time.isoformat()
         }
 
-    except Exception as e:
-        import traceback
+    except Exception:
         print("Feedback generation failed")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         if cursor:
             cursor.close()
@@ -3390,15 +3250,11 @@ async def generate_feedback_link(payload: FeedbackGenerateRequest):
 
 
 @app.get("/api/student/feedback/form", response_class=HTMLResponse)
-async def feedback_form(request: Request, request_id: Optional[str] = None, meeting_id: Optional[str] = None):
+async def feedback_form(request: Request, meeting_id: str):
     """
-    Renders the feedback form for a given request_id or meeting_id.
+    Renders the feedback form for a given meeting_id.
     Checks expiry and duplicate submission.
     """
-    lookup_id = request_id or meeting_id
-    if not lookup_id:
-        raise HTTPException(status_code=400, detail="Missing request_id or meeting_id")
-
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -3407,17 +3263,17 @@ async def feedback_form(request: Request, request_id: Optional[str] = None, meet
         cursor = conn.cursor(DictCursor)
         cursor.execute(
             """
-            SELECT request_id, meeting_id, student_email, student_name, expiry_time, feedback_sent
+            SELECT meeting_id, student_email, student_name, expiry_time, feedback_sent
             FROM NRM_FEEDBACK_REQUESTS
-            WHERE request_id = %s OR meeting_id = %s
+            WHERE meeting_id = %s
             """,
-            (lookup_id, lookup_id)
+            (meeting_id,)
         )
         record = cursor.fetchone()
         if not record:
             # Return simple error page
             return HTMLResponse(content="""
-            <html><body><h2>Invalid feedback link</h2><p>No feedback request found.</p></body></html>
+            <html><body><h2>Invalid feedback link</h2><p>No meeting found.</p></body></html>
             """, status_code=404)
 
         # Check expiry
@@ -3427,9 +3283,8 @@ async def feedback_form(request: Request, request_id: Optional[str] = None, meet
             <html><body><h2>Feedback link expired</h2><p>This feedback link has expired.</p></body></html>
             """, status_code=400)
 
-        # Check if already submitted (0 = False, 1 = True in Oracle)
-        sent_val = record.get("FEEDBACK_SENT")
-        if sent_val == 1 or sent_val is True:
+        # Check if already submitted
+        if record.get("FEEDBACK_SENT"):
             return HTMLResponse(content="""
             <html><body><h2>Feedback already submitted</h2><p>Thank you, your feedback has been recorded.</p></body></html>
             """, status_code=400)
@@ -3438,7 +3293,7 @@ async def feedback_form(request: Request, request_id: Optional[str] = None, meet
         from jinja2 import Template
         template = Template(FEEDBACK_FORM_HTML)
         html = template.render(
-            meeting_id=record["REQUEST_ID"] or record["MEETING_ID"] or lookup_id,
+            meeting_id=meeting_id,
             student_name=record["STUDENT_NAME"],
             student_email=record["STUDENT_EMAIL"],
             student_phone=""
@@ -3667,9 +3522,10 @@ def _handle_order_confirmed(payload: dict) -> None:
             cursor.execute("""
                 INSERT INTO NRM_REGISTRATIONS
                 (REGISTRATION_ID, STUDENT_ID, COURSE_ID, LANGUAGE_ID,
-                 STATUS_ID, CREATED_DT)
-                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-            """, (reg_id, student_id, course_id, language_id, active_id))
+                 START_DATE, STATUS_ID, CREATED_DT)
+                VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            """, (reg_id, student_id, course_id, language_id,
+                  start_date.strftime("%Y-%m-%d"), active_id))
 
             print(f"✅ Auto-registered: reg_id={reg_id} order_id={order_id} course_id={course_id}")
 

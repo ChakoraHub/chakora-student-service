@@ -10,6 +10,8 @@ import uvicorn
 import traceback
 import oracledb
 import os, json, uuid, httpx
+import secrets
+from pathlib import Path
 import boto3
 import mimetypes
 import shutil
@@ -56,6 +58,46 @@ FEEDBACK_BASE_URL = os.getenv("FEEDBACK_BASE_URL", "http://127.0.0.1:8282/feedba
 
 
 app = FastAPI(title="Student Service", version="3.0")
+
+# ================= STUDENT REGISTRATION MAINTENANCE =================
+# Persist the flag outside normal application state so a deployment restart
+# does not automatically clear maintenance mode.
+MAINTENANCE_FLAG = Path(
+    os.getenv(
+        "MAINTENANCE_FLAG",
+        str(Path(__file__).resolve().parent / "static" / "student-registration-maintenance.flag"),
+    )
+)
+MAINTENANCE_TOKEN = os.getenv("MAINTENANCE_TOKEN")
+
+def is_maintenance_enabled() -> bool:
+    return MAINTENANCE_FLAG.exists()
+
+def verify_maintenance_token(request: Request):
+    authorization = request.headers.get("Authorization", "")
+    supplied_token = authorization.removeprefix("Bearer ").strip()
+    if not MAINTENANCE_TOKEN or not secrets.compare_digest(
+        supplied_token, MAINTENANCE_TOKEN
+    ):
+        raise HTTPException(status_code=401, detail="Invalid maintenance token")
+
+@app.get("/api/student/maintenance/status")
+async def student_registration_maintenance_status():
+    return {"maintenance_mode": is_maintenance_enabled()}
+
+@app.post("/admin/maintenance/on")
+async def enable_student_registration_maintenance(request: Request):
+    verify_maintenance_token(request)
+    MAINTENANCE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    MAINTENANCE_FLAG.touch(exist_ok=True)
+    return {"success": True, "maintenance_mode": True}
+
+@app.post("/admin/maintenance/off")
+async def disable_student_registration_maintenance(request: Request):
+    verify_maintenance_token(request)
+    MAINTENANCE_FLAG.unlink(missing_ok=True)
+    return {"success": True, "maintenance_mode": False}
+
 
 app.add_middleware(
     CORSMiddleware,

@@ -85,14 +85,14 @@ def verify_maintenance_token(request: Request):
 async def student_registration_maintenance_status():
     return {"maintenance_mode": is_maintenance_enabled()}
 
-@app.post("/admin/maintenance/on")
+@app.post("/api/student/maintenance/on")
 async def enable_student_registration_maintenance(request: Request):
     verify_maintenance_token(request)
     MAINTENANCE_FLAG.parent.mkdir(parents=True, exist_ok=True)
     MAINTENANCE_FLAG.touch(exist_ok=True)
     return {"success": True, "maintenance_mode": True}
 
-@app.post("/admin/maintenance/off")
+@app.post("/api/student/maintenance/off")
 async def disable_student_registration_maintenance(request: Request):
     verify_maintenance_token(request)
     MAINTENANCE_FLAG.unlink(missing_ok=True)

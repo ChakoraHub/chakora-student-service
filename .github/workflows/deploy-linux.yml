@@ -105,11 +105,49 @@ jobs:
           path: selenium-results.xml
           if-no-files-found: warn
 
+  extra-smoke-tests:
+    name: Practice Test and Admin Upload Selenium smoke tests
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install selenium pytest
+
+      - name: Run Practice Test and Admin Upload Selenium smoke tests
+        env:
+          CHAKORAHUB_BASE_URL: https://www.chakorahub.com
+          EXPECT_MAINTENANCE_NOTICE: "true"
+          RUN_WRITE_TESTS: "false"
+          UPLOAD_EMPLOYEE_ID: ${{ secrets.UPLOAD_EMPLOYEE_ID }}
+          UPLOAD_EMPLOYEE_PASSWORD: ${{ secrets.UPLOAD_EMPLOYEE_PASSWORD }}
+        run: |
+          pytest -v -rs practice_test_smoke.py admin_upload_smoke.py --junitxml=extra-selenium-results.xml
+
+      - name: Upload extra Selenium results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extra-selenium-results
+          path: extra-selenium-results.xml
+          if-no-files-found: warn
+
   disable-maintenance:
     name: Disable Student Registration maintenance after passing tests
     runs-on: ubuntu-latest
-    needs: selenium-smoke-tests
-    if: ${{ needs.selenium-smoke-tests.result == 'success' }}
+    needs: [selenium-smoke-tests, extra-smoke-tests]
+    if: ${{ always() && needs.selenium-smoke-tests.result == 'success' }}
     steps:
       - name: Disable maintenance through Student Service
         env:
@@ -129,4 +167,3 @@ jobs:
             echo "Student Registration maintenance disable failed"
             exit 1
           fi
-

@@ -75,10 +75,32 @@ def login_employee(browser):
     browser.get(BASE_URL)
     wait_loaded(browser)
     Select(browser.find_element(By.ID, "login_type")).select_by_value("employee")
-    WebDriverWait(browser, WAIT).until(
+    emp_field = WebDriverWait(browser, WAIT).until(
         EC.visibility_of_element_located((By.ID, "employee_id"))
     )
+    emp_field.clear()
+    emp_field.send_keys(emp_id)
 
+    form = emp_field.find_element(By.XPATH, "./ancestor::form")
+    pwd_field = next(
+        e for e in form.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        if e.is_displayed()
+    )
+    pwd_field.clear()
+    pwd_field.send_keys(password)
+
+    submit = next(
+        b for b in form.find_elements(By.CSS_SELECTOR, "button[type='submit']")
+        if b.is_displayed()
+    )
+    safe_click(browser, submit)
+
+    # Wait for the login redirect to finish so the session cookie exists
+    WebDriverWait(browser, 60).until(
+        lambda d: "/employee-resources" in d.current_url,
+        message="Employee login did not reach /employee-resources",
+    )
+    wait_loaded(browser)    
     browser.find_element(By.CSS_SELECTOR, "form button[type='submit']").click()
     # Wait for the login redirect to finish so the session cookie exists
     WebDriverWait(browser, 60).until(
@@ -103,7 +125,35 @@ def open_upload_page(browser):
         )
     )
 
+    browser.get(BASE_URL)
+    wait_loaded(browser)
+    Select(browser.find_element(By.ID, "login_type")).select_by_value("employee")
+    emp_field = WebDriverWait(browser, WAIT).until(
+        EC.visibility_of_element_located((By.ID, "employee_id"))
+    )
+    emp_field.clear()
+    emp_field.send_keys(emp_id)
 
+    form = emp_field.find_element(By.XPATH, "./ancestor::form")
+    pwd_field = next(
+        e for e in form.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        if e.is_displayed()
+    )
+    pwd_field.clear()
+    pwd_field.send_keys(password)
+
+    submit = next(
+        b for b in form.find_elements(By.CSS_SELECTOR, "button[type='submit']")
+        if b.is_displayed()
+    )
+    safe_click(browser, submit)
+
+    # Wait for the login redirect to finish so the session cookie exists
+    WebDriverWait(browser, 60).until(
+        lambda d: "/employee-resources" in d.current_url,
+        message="Employee login did not reach /employee-resources",
+    )
+    wait_loaded(browser)
 def test_admin_upload_requires_login(driver):
     """Without a session, /admin/upload must be rejected (403 Access denied)."""
     driver.get(UPLOAD_URL)

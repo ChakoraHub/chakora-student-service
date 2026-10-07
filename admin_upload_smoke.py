@@ -63,7 +63,7 @@ def safe_click(browser, element):
 
 
 def login_employee(browser):
-    """Same login steps as test_blogger_smoke.py."""
+    """Log in as an employee and wait until the session cookie exists."""
     emp_id = os.getenv("UPLOAD_EMPLOYEE_ID")
     password = os.getenv("UPLOAD_EMPLOYEE_PASSWORD")
     if not emp_id or not password:
@@ -75,17 +75,33 @@ def login_employee(browser):
     browser.get(BASE_URL)
     wait_loaded(browser)
     Select(browser.find_element(By.ID, "login_type")).select_by_value("employee")
-    WebDriverWait(browser, WAIT).until(
+    emp_field = WebDriverWait(browser, WAIT).until(
         EC.visibility_of_element_located((By.ID, "employee_id"))
     )
+    emp_field.clear()
+    emp_field.send_keys(emp_id)
 
-    browser.find_element(By.CSS_SELECTOR, "form button[type='submit']").click()
+    form = emp_field.find_element(By.XPATH, "./ancestor::form")
+    pwd_field = next(
+        e for e in form.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        if e.is_displayed()
+    )
+    pwd_field.clear()
+    pwd_field.send_keys(password)
+
+    submit = next(
+        b for b in form.find_elements(By.CSS_SELECTOR, "button[type='submit']")
+        if b.is_displayed()
+    )
+    safe_click(browser, submit)
+
     # Wait for the login redirect to finish so the session cookie exists
     WebDriverWait(browser, 60).until(
         lambda d: "/employee-resources" in d.current_url,
         message="Employee login did not reach /employee-resources",
     )
     wait_loaded(browser)
+
 
 def open_upload_page(browser):
     login_employee(browser)
@@ -357,7 +373,6 @@ def test_employee_cannot_use_admin_only_upload_routes(driver):
         driver, form_css="form.org-upload-form[action$='/upload/org/hr_policy']"
     )
     assert "Access denied" in flash
-
 
 
 @pytest.mark.skipif(

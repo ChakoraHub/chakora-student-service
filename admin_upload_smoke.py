@@ -78,11 +78,14 @@ def login_employee(browser):
     WebDriverWait(browser, WAIT).until(
         EC.visibility_of_element_located((By.ID, "employee_id"))
     )
-    browser.find_element(By.ID, "employee_id").send_keys(emp_id)
-    browser.find_element(By.ID, "password").send_keys(password)
-    browser.find_element(By.CSS_SELECTOR, "form button[type='submit']").click()
-    wait_loaded(browser)
 
+    browser.find_element(By.CSS_SELECTOR, "form button[type='submit']").click()
+    # Wait for the login redirect to finish so the session cookie exists
+    WebDriverWait(browser, 60).until(
+        lambda d: "/employee-resources" in d.current_url,
+        message="Employee login did not reach /employee-resources",
+    )
+    wait_loaded(browser)
 
 def open_upload_page(browser):
     login_employee(browser)

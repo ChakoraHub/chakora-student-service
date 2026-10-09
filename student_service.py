@@ -10,6 +10,8 @@ import uvicorn
 import traceback
 import oracledb
 import os, json, uuid, httpx
+import secrets
+from pathlib import Path
 import boto3
 import mimetypes
 import shutil
@@ -133,6 +135,64 @@ async def disable_syllabus_maintenance(request: Request):
 
 
 
+
+# ================= STUDENT REGISTRATION MAINTENANCE =================
+# Persist the flag outside normal application state so a deployment restart
+# does not automatically clear maintenance mode.
+
+MAINTENANCE_FLAG = Path(
+    os.getenv(
+        "MAINTENANCE_FLAG",
+        str(
+            Path(__file__).resolve().parent
+            / "static"
+            / "student-registration-maintenance.flag"
+        ),
+    )
+)
+
+
+def is_maintenance_enabled() -> bool:
+    return MAINTENANCE_FLAG.exists()
+
+
+@app.get("/api/student/maintenance/status")
+async def student_registration_maintenance_status():
+    return {
+        "maintenance_mode": is_maintenance_enabled()
+    }
+
+
+@app.post("/api/student/maintenance/on")
+async def enable_student_registration_maintenance(
+    request: Request,
+):
+    verify_maintenance_token(request)
+
+    MAINTENANCE_FLAG.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    MAINTENANCE_FLAG.touch(exist_ok=True)
+
+    return {
+        "success": True,
+        "maintenance_mode": True,
+    }
+
+
+@app.post("/api/student/maintenance/off")
+async def disable_student_registration_maintenance(
+    request: Request,
+):
+    verify_maintenance_token(request)
+
+    MAINTENANCE_FLAG.unlink(missing_ok=True)
+
+    return {
+        "success": True,
+        "maintenance_mode": False,
+    }
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

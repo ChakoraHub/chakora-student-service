@@ -17,6 +17,8 @@ import mimetypes
 import shutil
 import requests
 import uuid
+from pathlib import Path
+import secrets
 from kafka import KafkaConsumer, KafkaProducer
 from threading import Thread
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
@@ -59,46 +61,138 @@ FEEDBACK_BASE_URL = os.getenv("FEEDBACK_BASE_URL", "http://127.0.0.1:8282/feedba
 
 app = FastAPI(title="Student Service", version="3.0")
 
+# ============================================================
+# SYLLABUS MAINTENANCE MODE
+# ============================================================
+
+SYLLABUS_MAINTENANCE_FLAG = Path(
+    os.getenv(
+        "SYLLABUS_MAINTENANCE_FLAG",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "syllabus-maintenance.flag"
+        )
+    )
+)
+
+MAINTENANCE_TOKEN = os.getenv("MAINTENANCE_TOKEN")
+
+
+def is_syllabus_maintenance_enabled() -> bool:
+    return SYLLABUS_MAINTENANCE_FLAG.exists()
+
+@app.get("/syllabus/maintenance/status")
+async def syllabus_maintenance_status():
+    return {
+        "maintenance_mode": is_syllabus_maintenance_enabled()
+    }
+
+def verify_maintenance_token(request: Request):
+    supplied_token = request.headers.get(
+        "Authorization", ""
+    ).removeprefix("Bearer ").strip()
+
+    if (
+        not MAINTENANCE_TOKEN
+        or not secrets.compare_digest(
+            supplied_token,
+            MAINTENANCE_TOKEN
+        )
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+@app.post("/admin/syllabus/maintenance/on")
+async def enable_syllabus_maintenance(request: Request):
+    verify_maintenance_token(request)
+
+    SYLLABUS_MAINTENANCE_FLAG.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    SYLLABUS_MAINTENANCE_FLAG.touch()
+
+    return {
+        "success": True,
+        "maintenance_mode": True
+    }
+
+@app.post("/admin/syllabus/maintenance/off")
+async def disable_syllabus_maintenance(request: Request):
+    verify_maintenance_token(request)
+
+    SYLLABUS_MAINTENANCE_FLAG.unlink(
+        missing_ok=True
+    )
+
+    return {
+        "success": True,
+        "maintenance_mode": False
+    }
+
+
+
+
 # ================= STUDENT REGISTRATION MAINTENANCE =================
 # Persist the flag outside normal application state so a deployment restart
 # does not automatically clear maintenance mode.
+
 MAINTENANCE_FLAG = Path(
     os.getenv(
         "MAINTENANCE_FLAG",
-        str(Path(__file__).resolve().parent / "static" / "student-registration-maintenance.flag"),
+        str(
+            Path(__file__).resolve().parent
+            / "static"
+            / "student-registration-maintenance.flag"
+        ),
     )
 )
-MAINTENANCE_TOKEN = os.getenv("MAINTENANCE_TOKEN")
+
 
 def is_maintenance_enabled() -> bool:
     return MAINTENANCE_FLAG.exists()
 
-def verify_maintenance_token(request: Request):
-    authorization = request.headers.get("Authorization", "")
-    supplied_token = authorization.removeprefix("Bearer ").strip()
-    if not MAINTENANCE_TOKEN or not secrets.compare_digest(
-        supplied_token, MAINTENANCE_TOKEN
-    ):
-        raise HTTPException(status_code=401, detail="Invalid maintenance token")
 
 @app.get("/api/student/maintenance/status")
 async def student_registration_maintenance_status():
-    return {"maintenance_mode": is_maintenance_enabled()}
+    return {
+        "maintenance_mode": is_maintenance_enabled()
+    }
+
 
 @app.post("/api/student/maintenance/on")
-async def enable_student_registration_maintenance(request: Request):
+async def enable_student_registration_maintenance(
+    request: Request,
+):
     verify_maintenance_token(request)
-    MAINTENANCE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+
+    MAINTENANCE_FLAG.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
     MAINTENANCE_FLAG.touch(exist_ok=True)
-    return {"success": True, "maintenance_mode": True}
+
+    return {
+        "success": True,
+        "maintenance_mode": True,
+    }
+
 
 @app.post("/api/student/maintenance/off")
-async def disable_student_registration_maintenance(request: Request):
+async def disable_student_registration_maintenance(
+    request: Request,
+):
     verify_maintenance_token(request)
+
     MAINTENANCE_FLAG.unlink(missing_ok=True)
-    return {"success": True, "maintenance_mode": False}
 
-
+    return {
+        "success": True,
+        "maintenance_mode": False,
+    }
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -3755,132 +3849,68 @@ _enrollment_consumer_thread.start()
 _consumer_thread = Thread(target=_run_lookup_consumer, daemon=True)
 _consumer_thread.start()
 
+# ==========================================
+# ORG DOCUMENTS → S3 (org-complaince-docs)
+# ==========================================
+ORG_S3_BUCKET = "org-complaince-docs"
+ORG_S3_REGION = "eu-north-1"
+ORG_S3_BASE_URL = f"https://{ORG_S3_BUCKET}.s3.{ORG_S3_REGION}.amazonaws.com"
+
+ORG_DOC_FOLDERS = {
+    "hr":         "hr-policy/",
+    "legal":      "legal-compliance/",
+    "finance":    "finance-accounts/",
+    "operations": "internal-operations/",
+}
+
+@app.post("/api/admin/upload-org-doc/{doc_type}")
+async def upload_org_doc(
+    doc_type: str,
+    file: UploadFile = File(...),
+    org_doc_category: str = Form(...),
+    uploaded_by: Optional[str] = Form(None),
+):
+    if doc_type not in ORG_DOC_FOLDERS:
+        raise HTTPException(status_code=400, detail=f"Invalid doc_type '{doc_type}'")
+
+    file_bytes = await file.read()
+    size_mb = len(file_bytes) / (1024 * 1024)
+    if size_mb > 20:
+        raise HTTPException(status_code=413, detail=f"File too large ({size_mb:.1f} MB). Max 20 MB.")
+
+    safe_category = org_doc_category.replace(" ", "_").replace("/", "-")
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    original_name = file.filename or "document"
+    folder_prefix = ORG_DOC_FOLDERS[doc_type]
+    s3_key = f"{folder_prefix}{safe_category}/{timestamp}_{original_name}"
+
+    region = os.getenv("AWS_REGION", "eu-north-1")
+    access_key = (os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY") or "").strip()
+    secret_key = (os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_KEY") or "").strip()
+
+    try:
+        s3 = boto3.client("s3", region_name=region,
+                          aws_access_key_id=access_key,
+                          aws_secret_access_key=secret_key)
+        s3.put_object(
+            Bucket=ORG_S3_BUCKET,
+            Key=s3_key,
+            Body=file_bytes,
+            ContentType=file.content_type or "application/octet-stream",
+        )
+    except Exception as e:
+        print(f"❌ Org doc S3 upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {str(e)}")
+
+    file_url = f"{ORG_S3_BASE_URL}/{s3_key}"
+    print(f"✅ Org doc uploaded: {file_url}")
+    return {
+        "success": True,
+        "message": "Document uploaded successfully",
+        "s3_key": s3_key,
+        "file_url": file_url,
+        "size_mb": round(size_mb, 2),
+    }
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
-
-
-# ==========================================
-# ORG DOCUMENTS → S3 (org-complaince-docs)
-# ==========================================
-ORG_S3_BUCKET = "org-complaince-docs"
-ORG_S3_REGION = "eu-north-1"
-ORG_S3_BASE_URL = f"https://{ORG_S3_BUCKET}.s3.{ORG_S3_REGION}.amazonaws.com"
-
-ORG_DOC_FOLDERS = {
-    "hr":         "hr-policy/",
-    "legal":      "legal-compliance/",
-    "finance":    "finance-accounts/",
-    "operations": "internal-operations/",
-}
-
-@app.post("/api/admin/upload-org-doc/{doc_type}")
-async def upload_org_doc(
-    doc_type: str,
-    file: UploadFile = File(...),
-    org_doc_category: str = Form(...),
-    uploaded_by: Optional[str] = Form(None),
-):
-    if doc_type not in ORG_DOC_FOLDERS:
-        raise HTTPException(status_code=400, detail=f"Invalid doc_type '{doc_type}'")
-
-    file_bytes = await file.read()
-    size_mb = len(file_bytes) / (1024 * 1024)
-    if size_mb > 20:
-        raise HTTPException(status_code=413, detail=f"File too large ({size_mb:.1f} MB). Max 20 MB.")
-
-    safe_category = org_doc_category.replace(" ", "_").replace("/", "-")
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    original_name = file.filename or "document"
-    folder_prefix = ORG_DOC_FOLDERS[doc_type]
-    s3_key = f"{folder_prefix}{safe_category}/{timestamp}_{original_name}"
-
-    region = os.getenv("AWS_REGION", "eu-north-1")
-    access_key = (os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY") or "").strip()
-    secret_key = (os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_KEY") or "").strip()
-
-    try:
-        s3 = boto3.client("s3", region_name=region,
-                          aws_access_key_id=access_key,
-                          aws_secret_access_key=secret_key)
-        s3.put_object(
-            Bucket=ORG_S3_BUCKET,
-            Key=s3_key,
-            Body=file_bytes,
-            ContentType=file.content_type or "application/octet-stream",
-        )
-    except Exception as e:
-        print(f"❌ Org doc S3 upload failed: {e}")
-        raise HTTPException(status_code=500, detail=f"S3 upload failed: {str(e)}")
-
-    file_url = f"{ORG_S3_BASE_URL}/{s3_key}"
-    print(f"✅ Org doc uploaded: {file_url}")
-    return {
-        "success": True,
-        "message": "Document uploaded successfully",
-        "s3_key": s3_key,
-        "file_url": file_url,
-        "size_mb": round(size_mb, 2),
-    }
-
-# ==========================================
-# ORG DOCUMENTS → S3 (org-complaince-docs)
-# ==========================================
-ORG_S3_BUCKET = "org-complaince-docs"
-ORG_S3_REGION = "eu-north-1"
-ORG_S3_BASE_URL = f"https://{ORG_S3_BUCKET}.s3.{ORG_S3_REGION}.amazonaws.com"
-
-ORG_DOC_FOLDERS = {
-    "hr":         "hr-policy/",
-    "legal":      "legal-compliance/",
-    "finance":    "finance-accounts/",
-    "operations": "internal-operations/",
-}
-
-@app.post("/api/admin/upload-org-doc/{doc_type}")
-async def upload_org_doc(
-    doc_type: str,
-    file: UploadFile = File(...),
-    org_doc_category: str = Form(...),
-    uploaded_by: Optional[str] = Form(None),
-):
-    if doc_type not in ORG_DOC_FOLDERS:
-        raise HTTPException(status_code=400, detail=f"Invalid doc_type '{doc_type}'")
-
-    file_bytes = await file.read()
-    size_mb = len(file_bytes) / (1024 * 1024)
-    if size_mb > 20:
-        raise HTTPException(status_code=413, detail=f"File too large ({size_mb:.1f} MB). Max 20 MB.")
-
-    safe_category = org_doc_category.replace(" ", "_").replace("/", "-")
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    original_name = file.filename or "document"
-    folder_prefix = ORG_DOC_FOLDERS[doc_type]
-    s3_key = f"{folder_prefix}{safe_category}/{timestamp}_{original_name}"
-
-    region = os.getenv("AWS_REGION", "eu-north-1")
-    access_key = (os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY") or "").strip()
-    secret_key = (os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_KEY") or "").strip()
-
-    try:
-        s3 = boto3.client("s3", region_name=region,
-                          aws_access_key_id=access_key,
-                          aws_secret_access_key=secret_key)
-        s3.put_object(
-            Bucket=ORG_S3_BUCKET,
-            Key=s3_key,
-            Body=file_bytes,
-            ContentType=file.content_type or "application/octet-stream",
-        )
-    except Exception as e:
-        print(f"❌ Org doc S3 upload failed: {e}")
-        raise HTTPException(status_code=500, detail=f"S3 upload failed: {str(e)}")
-
-    file_url = f"{ORG_S3_BASE_URL}/{s3_key}"
-    print(f"✅ Org doc uploaded: {file_url}")
-    return {
-        "success": True,
-        "message": "Document uploaded successfully",
-        "s3_key": s3_key,
-        "file_url": file_url,
-        "size_mb": round(size_mb, 2),
-    }

@@ -1,3 +1,10 @@
 __pycache__/
 uploads/
 static/student-registration-maintenance.flag
+
+.env
+ecosystem.config.js
+rsa_key.p8
+venv/
+*.log
+nohup.out
